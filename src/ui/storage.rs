@@ -38,3 +38,27 @@ pub fn delete() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+fn profile_path() -> Option<std::path::PathBuf> {
+    path().map(|p| p.with_file_name("profile.json"))
+}
+
+pub fn save_profile(p: &crate::logic::profile::Profile) {
+    let Some(path) = profile_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(p) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+pub fn load_profile() -> crate::logic::profile::Profile {
+    profile_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}

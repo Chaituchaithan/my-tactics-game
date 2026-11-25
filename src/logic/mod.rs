@@ -9,6 +9,7 @@ pub mod items;
 pub mod map;
 pub mod mapgen;
 pub mod pathfinding;
+pub mod profile;
 pub mod rng;
 pub mod supports;
 pub mod terrain;

@@ -8,7 +8,7 @@
 
 use super::rng::Rng;
 use super::terrain::Terrain;
-use super::unit::{Unit, Weapon};
+use super::unit::{Unit, Weapon, WeaponKind};
 
 pub const TRIANGLE_HIT: i32 = 15;
 pub const TRIANGLE_DMG: i32 = 1;
@@ -76,9 +76,26 @@ pub fn defense_against(u: &Unit, terrain: Terrain, foe_w: &Weapon) -> i32 {
     base + terrain.defense()
 }
 
+/// Bows are deadly against flying units (triple might).
+pub fn effective(w: &Weapon, foe: &Unit) -> bool {
+    w.kind == WeaponKind::Bow && foe.class.is_flying()
+}
+
+/// Fliers get no terrain bonuses.
+fn terrain_for(u: &Unit, t: Terrain) -> Terrain {
+    if u.class.is_flying() {
+        Terrain::Plains
+    } else {
+        t
+    }
+}
+
 pub fn damage(a: &Combatant, d: &Combatant) -> i32 {
     match &a.weapon {
-        Some(w) => (attack_power(a.unit, w, d.weapon.as_ref()) - defense_against(d.unit, d.terrain, w)).max(0),
+        Some(w) => {
+            let bonus = if effective(w, d.unit) { w.might * 2 } else { 0 };
+            (attack_power(a.unit, w, d.weapon.as_ref()) + bonus - defense_against(d.unit, terrain_for(d.unit, d.terrain), w)).max(0)
+        }
         None => 0,
     }
 }
@@ -93,7 +110,7 @@ pub fn avoid(u: &Unit, terrain: Terrain) -> i32 {
 
 pub fn hit_chance(a: &Combatant, d: &Combatant) -> i32 {
     match &a.weapon {
-        Some(w) => (accuracy(a.unit, w, d.weapon.as_ref()) + a.bonus.hit - avoid(d.unit, d.terrain) - d.bonus.avoid).clamp(0, 100),
+        Some(w) => (accuracy(a.unit, w, d.weapon.as_ref()) + a.bonus.hit - avoid(d.unit, terrain_for(d.unit, d.terrain)) - d.bonus.avoid).clamp(0, 100),
         None => 0,
     }
 }
@@ -304,6 +321,33 @@ mod tests {
         let cd = c(&d, Terrain::Forest);
         assert_eq!(hit_chance(&cd, &c(&a, Terrain::Plains).with_bonus(bonus)), hit_chance(&cd, &c(&a, Terrain::Plains)) - 5);
         assert_eq!(crit_chance(&cd, &c(&a, Terrain::Plains).with_bonus(bonus)), 25 + 2 - 4 - 6);
+    }
+
+    #[test]
+    fn bows_are_effective_against_fliers() {
+        let archer = dummy(Class::Archer, Team::Player, stats(5, 5, 5, 0, 3, 0), ItemId::ShortBow);
+        let peg = dummy(Class::PegasusKnight, Team::Enemy, stats(5, 0, 0, 0, 3, 0), ItemId::IronLance);
+        let knight = dummy(Class::Knight, Team::Enemy, stats(5, 0, 0, 0, 3, 0), ItemId::IronLance);
+        // 5 + 6 + 12 - 3 = 20 vs 5 + 6 - 3 = 8
+        assert_eq!(damage(&c(&archer, Terrain::Plains), &c(&peg, Terrain::Plains)), 20);
+        assert_eq!(damage(&c(&archer, Terrain::Plains), &c(&knight, Terrain::Plains)), 8);
+        // Fliers ignore forest bonuses.
+        assert_eq!(damage(&c(&archer, Terrain::Plains), &c(&peg, Terrain::Forest)), 20);
+    }
+
+    #[test]
+    fn forged_weapons_are_stronger() {
+        use crate::logic::items::Item;
+        let mut it = Item::new(ItemId::IronSword);
+        let base = it.weapon().unwrap();
+        it.forge = 2;
+        let w = it.weapon().unwrap();
+        assert_eq!((w.might, w.hit, w.crit), (base.might + 2, base.hit + 10, base.crit + 6));
+        assert_eq!(it.name(), "Iron Sword+2");
+        assert!(it.can_forge());
+        it.forge = crate::logic::items::MAX_FORGE;
+        assert!(!it.can_forge());
+        assert!(!Item::new(ItemId::Mend).can_forge());
     }
 
     #[test]

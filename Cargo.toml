@@ -5,7 +5,7 @@ edition = "2021"
 description = "Emberfall Tactics - a retro tactical strategy RPG"
 
 [dependencies]
-macroquad = { version = "0.4", default-features = false }
+macroquad = { version = "0.4", default-features = false, features = ["audio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

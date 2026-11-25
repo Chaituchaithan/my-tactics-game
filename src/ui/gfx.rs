@@ -380,6 +380,41 @@ fn paint_tile(t: Terrain, v: u8, frame: u8, alt: bool) -> Canvas {
             cv.shaded(8, 18, 16, 6, gold);
             cv.rect(15, 1, 2, 2, rgb(255, 240, 150));
         }
+        Terrain::Door => {
+            stone_wall(&mut cv, v);
+            cv.rect(5, 6, 22, 26, rgb(36, 26, 22));
+            cv.rect(6, 7, 20, 25, rgb(140, 92, 50));
+            for x in [10, 15, 20] {
+                cv.rect(x, 7, 1, 25, rgb(100, 64, 34));
+            }
+            for y in [11, 24] {
+                cv.rect(6, y, 20, 2, rgb(70, 70, 84));
+            }
+            cv.rect(14, 16, 5, 5, rgb(214, 180, 70));
+            cv.rect(16, 18, 1, 2, rgb(30, 20, 20));
+        }
+        Terrain::Chest => {
+            cobble(&mut cv, v, rgb(138, 144, 160));
+            let wood = rgb(150, 92, 44);
+            let gold = rgb(226, 186, 70);
+            cv.rect(5, 13, 22, 15, rgb(40, 26, 20));
+            if alt {
+                // opened: lid tipped back, glinting inside
+                cv.shaded(6, 18, 20, 9, wood);
+                cv.rect(6, 9, 20, 6, shade(wood, 0.8));
+                cv.rect(7, 16, 18, 3, rgb(60, 40, 26));
+                cv.rect(9, 16, 3, 2, rgb(255, 230, 120));
+                cv.rect(16, 17, 2, 1, rgb(255, 230, 120));
+            } else {
+                cv.shaded(6, 14, 20, 13, wood);
+                cv.rect(6, 14, 20, 4, shade(wood, 1.15));
+                cv.rect(6, 18, 20, 1, rgb(60, 40, 26));
+                cv.rect(6, 14, 2, 13, gold);
+                cv.rect(24, 14, 2, 13, gold);
+                cv.rect(14, 17, 4, 4, gold);
+                cv.set(16, 19, rgb(30, 20, 20));
+            }
+        }
         Terrain::Gate => {
             stone_wall(&mut cv, v);
             cv.rect(6, 7, 20, 25, rgb(40, 30, 26));
@@ -543,6 +578,9 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
     let class = if sorcerer { Class::Mage } else { l.class.base_look() };
     let promoted = l.class.is_promoted();
     let b = if up { -1 } else { 0 };
+    if matches!(class, Class::Cavalier | Class::PegasusKnight) {
+        return paint_rider(l, class, promoted, up);
+    }
     let robed = matches!(class, Class::Mage | Class::Cleric);
     let armored = class == Class::Knight;
     let heavy = armored || matches!(l.class, Class::General | Class::Warlord);
@@ -595,6 +633,11 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
     if class == Class::Mercenary {
         cv.shaded(11, 13 + b, 10, 7, leather);
         cv.rect(14, 13 + b, 4, 7, main);
+    }
+    if class == Class::Thief {
+        cv.shaded(10, 13 + b, 12, 8, shade(leather, 0.8));
+        cv.rect(10, 13 + b, 2, 8, shade(main, 0.6));
+        cv.rect(12, 16 + b, 1, 1, gold);
     }
     if l.class == Class::Warlord || (l.boss && !robed) {
         cv.ball(10.0, 14.0 + b as f32, 3.0, gold);
@@ -660,6 +703,12 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
         cv.rect(12, 3 + b, 9, 3, hair);
         cv.rect(11, 5 + b, 11, 2, band);
         cv.rect(10, 6 + b, 2, 4, band);
+    } else if class == Class::Thief {
+        let hood = shade(main, 0.55);
+        cv.shaded(11, 2 + b, 11, 5, hood);
+        cv.rect(11, 6 + b, 2, 6, hood);
+        cv.rect(13, 9 + b, 8, 3, shade(main, 0.45));
+        cv.rect(12, 4 + b, 9, 1, hair);
     } else if class == Class::Archer {
         let hood = if l.team == Team::Player { rgb(70, 130, 80) } else { shade(main, 0.8) };
         cv.shaded(11, 2 + b, 11, 5, hood);
@@ -712,6 +761,11 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
     // Weapon
     let wood = rgb(130, 86, 46);
     match l.weapon {
+        WeaponKind::Sword if class == Class::Thief => {
+            cv.rect(25, 12 + b, 2, 9, rgb(226, 230, 240));
+            cv.rect(24, 20 + b, 4, 1, gold);
+            cv.rect(25, 21 + b, 2, 3, leather);
+        }
         WeaponKind::Sword => {
             cv.rect(25, 4 + b, 2, 17, rgb(226, 230, 240));
             cv.rect(26, 4 + b, 1, 17, rgb(160, 168, 186));
@@ -760,6 +814,84 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
         }
     }
 
+    cv.outline(rgb(24, 18, 28));
+    cv
+}
+
+/// Horse or pegasus rider (32x32, facing right).
+fn paint_rider(l: &UnitLook, class: Class, promoted: bool, up: bool) -> Canvas {
+    let mut cv = Canvas::new(32, 32);
+    let main = palette(l);
+    let skin = skin_of(l);
+    let hair = hair_of(l);
+    let metal = rgb(200, 206, 218);
+    let gold = rgb(226, 184, 70);
+    let pegasus = class == Class::PegasusKnight;
+    let coat = if pegasus { rgb(240, 240, 248) } else if l.pale { rgb(170, 180, 200) } else { rgb(150, 98, 58) };
+    let mane = if pegasus { rgb(200, 210, 240) } else { rgb(70, 44, 26) };
+    let b = if up { -1 } else { 0 };
+    let gallop = if up { 1 } else { 0 };
+
+    // Wings (behind)
+    if pegasus {
+        for k in 0..8 {
+            cv.rect(3 + k, 6 + k / 2 + b, 9 - k, 1, if k % 2 == 0 { rgb(250, 250, 255) } else { rgb(214, 220, 240) });
+        }
+        cv.rect(4, 10 + b, 8, 5, rgb(236, 238, 250));
+    }
+    // Tail and legs
+    cv.rect(2, 17, 3, 6, mane);
+    for (x, d) in [(7, gallop), (11, -gallop), (19, -gallop), (23, gallop)] {
+        cv.shaded(x, 24 + d.min(0), 3, 6 - d.abs(), shade(coat, 0.85));
+        cv.rect(x, 29, 3, 1, rgb(50, 40, 34));
+    }
+    // Body, neck, head
+    cv.shaded(5, 16, 22, 9, coat);
+    cv.rect(6, 16, 20, 2, shade(coat, 1.1));
+    cv.shaded(22, 10, 5, 9, coat);
+    cv.shaded(24, 7, 7, 5, coat);
+    cv.rect(29, 10, 2, 2, shade(coat, 0.75));
+    cv.set(27, 8, rgb(30, 24, 30));
+    cv.rect(21, 7, 3, 6, mane);
+    cv.rect(24, 6, 2, 2, coat);
+    // Saddle cloth in team colours
+    cv.shaded(11, 15, 9, 6, main);
+    cv.rect(11, 20, 9, 1, gold);
+    // Rider
+    cv.shaded(12, 8 + b, 7, 8, if promoted || !pegasus { main } else { shade(main, 1.1) });
+    if !pegasus {
+        cv.shaded(12, 8 + b, 7, 4, metal);
+    }
+    cv.shaded(13, 1 + b, 6, 7, skin);
+    cv.set(16, 4 + b, rgb(30, 24, 30));
+    if pegasus || l.style == Hair::Long {
+        cv.rect(12, b, 7, 2, hair);
+        cv.rect(11, 1 + b, 2, 8, hair);
+    } else {
+        cv.shaded(12, b, 8, 3, metal);
+        cv.rect(12, 2 + b, 2, 4, metal);
+        cv.rect(15, -1 + b, 2, 2, main);
+    }
+    if promoted {
+        cv.rect(12, 8 + b, 7, 1, gold);
+    }
+    cv.rect(18, 11 + b, 3, 2, skin);
+    // Weapon: couched lance or raised sword
+    match l.weapon {
+        WeaponKind::Sword => {
+            cv.rect(20, 1 + b, 2, 11, rgb(226, 230, 240));
+            cv.rect(19, 11 + b, 4, 1, gold);
+        }
+        WeaponKind::Axe => {
+            cv.rect(20, 3 + b, 2, 10, rgb(130, 86, 46));
+            cv.shaded(22, 2 + b, 4, 5, metal);
+        }
+        _ => {
+            cv.line(14, 15 + b, 31, 4 + b, rgb(130, 86, 46));
+            cv.line(14, 16 + b, 31, 5 + b, rgb(110, 72, 40));
+            cv.rect(29, 3 + b, 3, 2, metal);
+        }
+    }
     cv.outline(rgb(24, 18, 28));
     cv
 }

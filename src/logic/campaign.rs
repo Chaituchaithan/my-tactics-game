@@ -137,6 +137,8 @@ pub struct ChapterDef {
 /// Everything needed to start a battle.
 pub struct Setup {
     pub map: Map,
+    pub chests: Vec<(Pos, Reward)>,
+    pub fog: bool,
     pub starts: Vec<Pos>,
     pub enemies: Vec<Unit>,
     pub reinforcements: Vec<(u32, Unit)>,
@@ -268,7 +270,8 @@ pub fn setup(n: usize) -> Setup {
         Field::Fixed { rows, starts, enemies, reinforcements, villages } => {
             let map = Map::from_rows(&rows);
             let objective = objective(def.goal, &map);
-            Setup { map, starts, enemies, reinforcements, villages, objective }
+            let chests = chest_rewards(n, &map);
+            Setup { map, chests, fog: fog_chapter(n), starts, enemies, reinforcements, villages, objective }
         }
         Field::Generated { spec: sp, squads, named, reinforcements, rewards } => {
             let g = mapgen::generate(&sp);
@@ -303,12 +306,81 @@ pub fn setup(n: usize) -> Setup {
             }
             let villages = g.villages.iter().copied().zip(rewards).collect();
             let objective = objective(def.goal, &g.map);
-            Setup { map: g.map, starts: g.starts, enemies, reinforcements: reinf, villages, objective }
+            let chests = chest_rewards(n, &g.map);
+            Setup { map: g.map, chests, fog: fog_chapter(n), starts: g.starts, enemies, reinforcements: reinf, villages, objective }
         }
     }
 }
 
+/// Chapters with fog of war: marsh mist, a blizzard, a night landing.
+pub fn fog_chapter(n: usize) -> bool {
+    matches!(n, 4 | 11 | 13)
+}
+
+/// Rewards for every chest tile on the map, in reading order.
+fn chest_rewards(n: usize, map: &Map) -> Vec<(Pos, Reward)> {
+    use ItemId::*;
+    let pool = [
+        Reward::Item(Elixir),
+        Reward::Gold(1500 + 250 * n as i32),
+        Reward::Item(MasterSeal),
+        Reward::Item(if n < 8 { SteelSword } else { SilverSword }),
+        Reward::Item(if n < 8 { SteelLance } else { SilverLance }),
+        Reward::Item(if n < 8 { Blaze } else { Inferno }),
+    ];
+    let mut out = Vec::new();
+    for y in 0..map.height {
+        for x in 0..map.width {
+            if map.at(Pos::new(x, y)) == Terrain::Chest {
+                out.push((Pos::new(x, y), pool[(n + out.len()) % pool.len()]));
+            }
+        }
+    }
+    out
+}
+
 pub fn chapter(n: usize) -> ChapterDef {
+    use Class::*;
+    use ItemId::*;
+    use Zone::*;
+    let mut d = chapter_base(n);
+    // New recruits: cavalry, a thief and a pegasus knight.
+    match n {
+        2 => {
+            d.joins.push(ally("Garrett", Cavalier, 4, s(24, 8, 6, 7, 4, 7, 1), s(80, 45, 40, 45, 35, 30, 15), &[IronLance, IronSword]));
+            d.intro.insert(1, l("Garrett", "Garrett, Hollowmere's last rider. My horse and I are yours, my lord. We're fast on open ground, slower in the woods."));
+        }
+        3 => {
+            d.joins.push(ally("Pip", Thief, 3, s(18, 5, 8, 12, 7, 3, 2), s(60, 35, 50, 65, 50, 15, 25), &[IronSword, ChestKey]));
+            d.intro.insert(1, l("Pip", "Name's Pip. I can open any lock in that keep, and lift a purse or two off the guards. Thieves move freely in the dark, too."));
+        }
+        5 => {
+            d.joins.push(ally("Skye", PegasusKnight, 5, s(20, 7, 9, 13, 8, 5, 8), s(60, 40, 45, 60, 55, 15, 40), &[IronLance, Javelin]));
+            d.intro.insert(1, l("Skye", "Skye, of the cloud riders! My pegasus can fly over these peaks. Just keep me away from their archers. Arrows are our bane."));
+        }
+        _ => {}
+    }
+    if fog_chapter(n) {
+        d.intro.push(l("", "Fog of war: you can only see enemies near your units. Thieves and fliers see farther."));
+    }
+    // Enemy cavalry and fliers.
+    if let Field::Generated { squads, .. } = &mut d.field {
+        let extra: &[Squad] = match n {
+            4 => &[sq("Cavalier", Cavalier, 5, &[IronLance], 2, Mid)],
+            5 => &[sq("Pegasus Knight", PegasusKnight, 6, &[IronLance], 2, Rear)],
+            7 => &[sq("Paladin", Paladin, 2, &[SteelSword], 2, Mid)],
+            8 => &[sq("Falcon Knight", FalconKnight, 3, &[SteelLance], 2, Rear)],
+            9 => &[sq("Paladin", Paladin, 4, &[SteelLance], 2, Front), sq("Falcon Knight", FalconKnight, 4, &[SteelLance], 2, Mid)],
+            11 | 13 => &[sq("Pale Rider", Paladin, 7, &[SilverLance], 2, Mid), sq("Pale Wing", FalconKnight, 7, &[SteelLance], 2, Rear)],
+            14 | 15 => &[sq("Pale Rider", Paladin, 10, &[SilverLance], 2, Mid), sq("Pale Wing", FalconKnight, 10, &[SilverLance], 2, Mid)],
+            _ => &[],
+        };
+        squads.extend_from_slice(extra);
+    }
+    d
+}
+
+fn chapter_base(n: usize) -> ChapterDef {
     use Class::*;
     use ItemId::*;
     use Zone::*;
@@ -494,7 +566,7 @@ pub fn chapter(n: usize) -> ChapterDef {
                 rows: [
                 "~~~~....FF.#####",
                 "~~~...F....#,,H#",
-                "~~.......F.#,P,#",
+                "~~.......F.#CP,#",
                 "~...FF.....,,,,#",
                 "~.......T..#,,,#",
                 "....F......##G##",
@@ -1039,15 +1111,261 @@ pub struct Campaign {
     pub supports: Vec<SupportState>,
     #[serde(default = "yes")]
     pub battle_scenes: bool,
+    #[serde(default)]
+    pub difficulty: Difficulty,
+    /// New Game+ cycle (0 = first playthrough).
+    #[serde(default)]
+    pub ng_plus: u32,
 }
 
 fn yes() -> bool {
     true
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Difficulty {
+    Easy,
+    #[default]
+    Normal,
+    Hard,
+}
+
+impl Difficulty {
+    pub fn name(self) -> &'static str {
+        match self {
+            Difficulty::Easy => "Easy",
+            Difficulty::Normal => "Normal",
+            Difficulty::Hard => "Hard",
+        }
+    }
+
+    pub fn next(self) -> Difficulty {
+        match self {
+            Difficulty::Easy => Difficulty::Normal,
+            Difficulty::Normal => Difficulty::Hard,
+            Difficulty::Hard => Difficulty::Easy,
+        }
+    }
+}
+
+/// Adjusts an enemy for difficulty and New Game+ cycles.
+pub fn toughen(u: &mut Unit, d: Difficulty, ng: u32) {
+    let mut st = u.stats.to_array();
+    match d {
+        Difficulty::Easy => {
+            st[0] = st[0] * 85 / 100;
+            for v in st.iter_mut().skip(1).take(3) {
+                *v = (*v - 1).max(0);
+            }
+        }
+        Difficulty::Normal => {}
+        Difficulty::Hard => {
+            st[0] = st[0] * 115 / 100;
+            st[1] += 2;
+            st[2] += 2;
+            st[3] += 1;
+            st[5] += 1;
+        }
+    }
+    let n = ng as i32;
+    let ngb = [3 * n, 2 * n, n, n, 0, n, n];
+    for i in 0..7 {
+        st[i] = (st[i] + ngb[i]).min(super::unit::STAT_CAPS[i]);
+    }
+    u.stats = Stats::from_array(st);
+    u.hp = u.stats.hp;
+}
+
+/// Result of one arena bout.
+#[derive(Clone, Debug)]
+pub struct ArenaResult {
+    pub won: bool,
+    pub bet: i32,
+    pub log: Vec<String>,
+    pub level_up: Option<super::unit::LevelUp>,
+}
+
 impl Campaign {
+    #[cfg(test)]
     pub fn new(permadeath: bool) -> Campaign {
-        Campaign { chapter: 0, army: starting_army(), gold: 0, permadeath, fallen: Vec::new(), joined_through: 0, finished: false, supports: Vec::new(), battle_scenes: true }
+        Campaign::new_with(permadeath, Difficulty::Normal)
+    }
+
+    pub fn new_with(permadeath: bool, difficulty: Difficulty) -> Campaign {
+        Campaign {
+            chapter: 0,
+            army: starting_army(),
+            gold: 0,
+            permadeath,
+            fallen: Vec::new(),
+            joined_through: 0,
+            finished: false,
+            supports: Vec::new(),
+            battle_scenes: true,
+            difficulty,
+            ng_plus: 0,
+        }
+    }
+
+    /// New Game+: keep the finished army, gold and bonds; enemies grow stronger.
+    pub fn new_game_plus(prev: &Campaign) -> Campaign {
+        let mut c = Campaign::new_with(prev.permadeath, prev.difficulty);
+        c.army = prev.army.clone();
+        for u in c.army.iter_mut() {
+            u.hp = u.stats.hp;
+            u.alive = true;
+        }
+        c.gold = prev.gold;
+        c.supports = prev.supports.clone();
+        c.battle_scenes = prev.battle_scenes;
+        c.ng_plus = prev.ng_plus + 1;
+        c
+    }
+
+    fn harden(&self, u: &mut Unit) {
+        toughen(u, self.difficulty, self.ng_plus);
+        if self.ng_plus > 0 {
+            u.level = (u.level + 3 * self.ng_plus as i32).min(super::unit::MAX_LEVEL);
+        }
+    }
+
+    /// Average effective level of the army (for skirmishes and the arena).
+    pub fn army_level(&self) -> i32 {
+        if self.army.is_empty() {
+            return 1;
+        }
+        self.army.iter().map(|u| u.effective_level()).sum::<i32>() / self.army.len() as i32
+    }
+
+    /// An optional battle on a random generated map, scaled to the army.
+    pub fn skirmish(&self, seed: u64) -> Battle {
+        use Class::*;
+        use ItemId::*;
+        let mut rng = Rng::new(seed);
+        let themes = [Theme::Grass, Theme::Woods, Theme::Highlands, Theme::Marsh, Theme::Ruins];
+        let theme = themes[rng.next_u64() as usize % themes.len()];
+        let tier = if self.army.len() > 10 { Tier::Large } else { Tier::Medium };
+        let river = theme != Theme::Highlands && rng.roll(40);
+        let castle = theme == Theme::Ruins || rng.roll(25);
+        let sp = spec(tier, seed, theme, Layout::March, river, castle, 2, 2);
+        let g = mapgen::generate(&sp);
+        let lvl = self.army_level();
+        let promoted = lvl >= 12;
+        let level = if promoted { (lvl - 10).max(1) } else { (lvl - 1).max(1) };
+        let pool: [(Class, &[ItemId]); 6] = if promoted {
+            [(Hero, &[SteelSword]), (Warrior, &[SteelAxe]), (Halberdier, &[SteelLance]), (Sniper, &[SteelBow]), (Sage, &[Blaze]), (Paladin, &[SteelLance])]
+        } else {
+            [(Mercenary, &[IronSword]), (Brigand, &[IronAxe]), (Soldier, &[IronLance]), (Archer, &[ShortBow]), (Mage, &[Ember]), (Cavalier, &[IronLance])]
+        };
+        let count = if tier == Tier::Large { 16 } else { 12 };
+        let mut taken = Vec::new();
+        let mut enemies = Vec::new();
+        for i in 0..count {
+            let (class, items) = pool[i % pool.len()];
+            let zone = [Zone::Front, Zone::Mid, Zone::Rear][i % 3];
+            for at in place(&g, &sp, zone, class, 1, &mut taken, &mut rng) {
+                let mut u = Unit::generic(class.name(), class, Team::Enemy, level, items, at);
+                self.harden(&mut u);
+                enemies.push(u);
+            }
+        }
+        let mut units = Vec::new();
+        for (slot, idx) in self.deployment(g.starts.len()).into_iter().enumerate() {
+            let mut u = self.army[idx].clone();
+            u.hp = u.stats.hp;
+            u.done = false;
+            u.alive = true;
+            u.team = Team::Player;
+            u.pos = g.starts[slot];
+            units.push(u);
+        }
+        units.extend(enemies);
+        let chests = chest_rewards(self.chapter, &g.map);
+        let mut b = Battle::new(g.map, units, seed, self.permadeath);
+        b.objective = Objective::Rout;
+        b.supports = self.support_list();
+        b.villages = g.villages.iter().map(|p| Village { pos: *p, reward: Reward::Gold(300 + 50 * lvl), visited: false }).collect();
+        b.chests = chests.into_iter().map(|(pos, reward)| super::battle::Chest { pos, reward, opened: false }).collect();
+        b
+    }
+
+    /// Applies a won skirmish: experience, items, gold and losses, without advancing the story.
+    pub fn finish_skirmish(&mut self, b: &Battle) {
+        self.merge_units(b);
+        self.gold += b.gold + 400 + 60 * self.army_level();
+    }
+
+    /// Gold staked on an arena bout for army unit `idx`.
+    pub fn arena_bet(&self, idx: usize) -> i32 {
+        300 + 40 * self.army[idx].effective_level()
+    }
+
+    /// Fights a one-on-one arena bout. Losing costs the bet, never the unit.
+    pub fn arena(&mut self, idx: usize, seed: u64) -> Option<ArenaResult> {
+        use super::combat::{forecast, resolve, Combatant};
+        let bet = self.arena_bet(idx);
+        if self.gold < bet || self.army[idx].weapon().is_none() {
+            return None;
+        }
+        self.gold -= bet;
+        let mut rng = Rng::new(seed);
+        let me = self.army[idx].clone();
+        let promoted = me.class.is_promoted();
+        let picks: [(Class, ItemId); 5] = if promoted {
+            [(Class::Hero, ItemId::SteelSword), (Class::Warrior, ItemId::SteelAxe), (Class::Halberdier, ItemId::SteelLance), (Class::Sage, ItemId::Blaze), (Class::Sniper, ItemId::SteelBow)]
+        } else {
+            [(Class::Mercenary, ItemId::IronSword), (Class::Fighter, ItemId::IronAxe), (Class::Soldier, ItemId::IronLance), (Class::Mage, ItemId::Ember), (Class::Archer, ItemId::ShortBow)]
+        };
+        let (class, item) = picks[rng.next_u64() as usize % picks.len()];
+        let lvl = (me.level + (rng.next_u64() % 3) as i32 - 1).clamp(1, super::unit::MAX_LEVEL);
+        let mut foe = Unit::generic("Gladiator", class, Team::Enemy, lvl, &[item], Pos::new(0, 0));
+        self.harden(&mut foe);
+        let mut mine = me.clone();
+        let dist = if mine.weapon().is_some_and(|w| w.min_range > 1) { 2 } else { 1 };
+        mine.equip_for_range(dist);
+        let mut log = vec![format!("{} faces a level {} {}!", me.name, foe.level, class.name())];
+        let mut won = false;
+        for round in 0..10 {
+            let f = forecast(&Combatant::new(&mine, Terrain::Plains), &Combatant::new(&foe, Terrain::Plains), dist);
+            let out = resolve(&f, &mut rng);
+            mine.hp = out.attacker_hp;
+            foe.hp = out.defender_hp;
+            log.push(format!("Round {}: {} {} HP, {} {} HP", round + 1, me.name, mine.hp, class.name(), foe.hp));
+            if foe.hp == 0 {
+                won = true;
+                break;
+            }
+            if mine.hp == 0 {
+                break;
+            }
+        }
+        let mut level_up = None;
+        if won {
+            self.gold += bet * 2;
+            let xp = super::combat::combat_xp(me.effective_level(), foe.effective_level(), true, true, false);
+            level_up = self.army[idx].gain_xp(xp, &mut rng);
+            log.push(format!("Victory! +{} gold, +{} EXP.", bet, xp));
+        } else if mine.hp == 0 {
+            log.push(format!("{} is carried from the arena. The bet is lost.", me.name));
+        } else {
+            log.push("The bout ends in a draw. The bet is lost.".to_string());
+        }
+        Some(ArenaResult { won, bet, log, level_up })
+    }
+
+    /// Spends gold to forge item `item` of unit `idx` one level higher.
+    pub fn forge(&mut self, idx: usize, item: usize) -> Result<i32, &'static str> {
+        let it = self.army.get(idx).and_then(|u| u.items.get(item)).copied().ok_or("No such item.")?;
+        if !it.can_forge() {
+            return Err("This can't be forged any further.");
+        }
+        let cost = it.forge_cost();
+        if self.gold < cost {
+            return Err("Not enough gold.");
+        }
+        self.gold -= cost;
+        self.army[idx].items[item].forge += 1;
+        Ok(cost)
     }
 
     pub fn def(&self) -> ChapterDef {
@@ -1087,12 +1405,21 @@ impl Campaign {
             u.pos = def.starts[slot];
             units.push(u);
         }
-        units.extend(def.enemies);
+        let mut enemies = def.enemies;
+        for e in enemies.iter_mut() {
+            self.harden(e);
+        }
+        units.extend(enemies);
         let mut b = Battle::new(def.map, units, seed, self.permadeath);
         b.supports = self.support_list();
         b.objective = def.objective;
         b.reinforcements = def.reinforcements;
+        for (_, e) in b.reinforcements.iter_mut() {
+            self.harden(e);
+        }
         b.villages = def.villages.into_iter().map(|(pos, reward)| Village { pos, reward, visited: false }).collect();
+        b.chests = def.chests.into_iter().map(|(pos, reward)| super::battle::Chest { pos, reward, opened: false }).collect();
+        b.fog = def.fog;
         b
     }
 
@@ -1127,6 +1454,16 @@ impl Campaign {
 
     /// Copies the battle's results back into the army and advances the chapter.
     pub fn finish_chapter(&mut self, b: &Battle) {
+        self.merge_units(b);
+        self.gold += b.gold + self.def().reward_gold;
+        if self.chapter + 1 >= CHAPTER_COUNT {
+            self.finished = true;
+        } else {
+            self.chapter += 1;
+        }
+    }
+
+    fn merge_units(&mut self, b: &Battle) {
         for st in &b.supports {
             self.store_support(st.clone());
         }
@@ -1147,12 +1484,6 @@ impl Campaign {
                 None if lost => self.fallen.push(u.name.clone()),
                 None => self.army.push(kept),
             }
-        }
-        self.gold += b.gold + self.def().reward_gold;
-        if self.chapter + 1 >= CHAPTER_COUNT {
-            self.finished = true;
-        } else {
-            self.chapter += 1;
         }
     }
 }
@@ -1206,9 +1537,9 @@ mod tests {
             assert!(!def.intro.is_empty() && !def.outro.is_empty());
             let expected = match def.tier {
                 Tier::Small => 7..=13,
-                Tier::Medium => 11..=20,
-                Tier::Large => 14..=26,
-                Tier::ExtraLarge => 19..=34,
+                Tier::Medium => 11..=22,
+                Tier::Large => 14..=28,
+                Tier::ExtraLarge => 19..=38,
             };
             assert!(expected.contains(&st.enemies.len()), "chapter {n}: {} enemies for {:?}", st.enemies.len(), def.tier);
         }
@@ -1313,6 +1644,98 @@ mod tests {
         let c: Campaign = serde_json::from_value(v).unwrap();
         assert!(c.supports.is_empty());
         assert!(c.battle_scenes);
+    }
+
+    #[test]
+    fn difficulty_scales_enemies() {
+        let mut easy = Campaign::new_with(true, Difficulty::Easy);
+        let mut hard = Campaign::new_with(true, Difficulty::Hard);
+        easy.begin_chapter();
+        hard.begin_chapter();
+        let e = easy.battle(1);
+        let h = hard.battle(1);
+        let boss = |b: &Battle| b.units.iter().find(|u| u.is_boss).unwrap().stats;
+        assert!(boss(&e).hp < boss(&h).hp);
+        assert!(boss(&e).pow < boss(&h).pow);
+    }
+
+    #[test]
+    fn new_game_plus_keeps_army_and_toughens_foes() {
+        let mut c = Campaign::new(true);
+        c.army[0].level = 15;
+        c.gold = 9999;
+        c.finished = true;
+        let ng = Campaign::new_game_plus(&c);
+        assert_eq!(ng.chapter, 0);
+        assert_eq!(ng.ng_plus, 1);
+        assert_eq!(ng.army[0].level, 15);
+        assert_eq!(ng.gold, 9999);
+        let base = Campaign::new(true).battle(1);
+        let plus = { let mut n = ng.clone(); n.begin_chapter(); n.battle(1) };
+        let boss = |b: &Battle| b.units.iter().find(|u| u.is_boss).unwrap().stats.hp;
+        assert!(boss(&plus) > boss(&base));
+    }
+
+    #[test]
+    fn skirmish_is_a_playable_rout() {
+        let mut c = Campaign::new(true);
+        c.begin_chapter();
+        for seed in 0..5 {
+            let b = c.skirmish(seed);
+            assert_eq!(b.objective, Objective::Rout);
+            assert!(b.living(Team::Enemy).count() >= 8);
+            assert!(b.units[0].is_lord);
+        }
+        let mut b = c.skirmish(3);
+        b.units[0].level = 9;
+        let gold = c.gold;
+        c.finish_skirmish(&b);
+        assert_eq!(c.chapter, 0, "skirmishes don't advance the story");
+        assert_eq!(c.army[0].level, 9);
+        assert!(c.gold > gold);
+    }
+
+    #[test]
+    fn arena_costs_or_pays() {
+        let mut c = Campaign::new(true);
+        c.gold = 100;
+        assert!(c.arena(0, 1).is_none(), "can't afford the bet");
+        c.gold = 10_000;
+        let mut wins = 0;
+        for seed in 0..20 {
+            let before = c.gold;
+            let r = c.arena(0, seed).unwrap();
+            if r.won {
+                wins += 1;
+                assert_eq!(c.gold, before + r.bet);
+            } else {
+                assert_eq!(c.gold, before - r.bet);
+            }
+            assert!(c.army[0].alive);
+        }
+        assert!(wins > 0);
+    }
+
+    #[test]
+    fn forging_costs_gold_and_caps() {
+        let mut c = Campaign::new(true);
+        c.gold = 100_000;
+        let start = c.gold;
+        for _ in 0..crate::logic::items::MAX_FORGE {
+            c.forge(0, 0).unwrap();
+        }
+        assert_eq!(c.army[0].items[0].forge, crate::logic::items::MAX_FORGE);
+        assert!(c.forge(0, 0).is_err());
+        assert!(c.gold < start);
+        assert!(c.forge(0, 1).is_err(), "vulneraries can't be forged");
+    }
+
+    #[test]
+    fn castle_maps_have_chests() {
+        let with_chests = (0..CHAPTER_COUNT).filter(|n| !setup(*n).chests.is_empty()).count();
+        assert!(with_chests >= 4, "{with_chests}");
+        assert!(fog_chapter(4) && !fog_chapter(0));
+        assert!(setup(4).fog);
     }
 
     #[test]

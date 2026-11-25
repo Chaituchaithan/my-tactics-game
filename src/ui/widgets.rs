@@ -276,7 +276,11 @@ pub fn button(input: &mut Input, r: Rect, label: &str, style: ButtonStyle, u: f3
     let size = u * 1.0;
     let c = if style == ButtonStyle::Disabled { DIM } else { INK };
     text_centered(label, r.x + r.w / 2.0, r.y + r.h / 2.0 + size * 0.33, size, c);
-    style != ButtonStyle::Disabled && input.tapped_in(r)
+    let pressed = style != ButtonStyle::Disabled && input.tapped_in(r);
+    if pressed {
+        super::audio::sfx(super::audio::Sfx::Select);
+    }
+    pressed
 }
 
 pub fn hp_bar(x: f32, y: f32, w: f32, h: f32, hp: i32, max: i32) {

@@ -2,10 +2,11 @@ use std::collections::HashSet;
 
 use super::combat::{self, Bonus, CombatOutcome, Combatant, Forecast, Side};
 use super::supports::{self, SupportState};
-use super::items::{ItemId, ItemKind};
+use super::items::{ItemId, ItemKind, KeyKind, MAX_ITEMS};
 use super::map::Map;
 use super::pathfinding::{reachable, tiles_in_range, Occupant, Reach};
 use super::rng::Rng;
+use super::terrain::Terrain;
 use super::unit::{AiMode, LevelUp, Promotion, Team, Unit, MAX_LEVEL};
 use super::Pos;
 
@@ -45,6 +46,21 @@ pub struct Village {
     pub pos: Pos,
     pub reward: Reward,
     pub visited: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Chest {
+    pub pos: Pos,
+    pub reward: Reward,
+    pub opened: bool,
+}
+
+/// Things that happened during the battle (for achievements).
+#[derive(Clone, Debug, Default)]
+pub struct BattleStats {
+    pub chests: u32,
+    pub steals: u32,
+    pub promotions: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +134,10 @@ pub struct Battle {
     pub seized: bool,
     /// Support bonds between the deployed allies (points grow during battle).
     pub supports: Vec<SupportState>,
+    pub chests: Vec<Chest>,
+    /// Fog of war: the player only sees what their units can see.
+    pub fog: bool,
+    pub stats: BattleStats,
 }
 
 impl Battle {
@@ -136,6 +156,9 @@ impl Battle {
             gold: 0,
             seized: false,
             supports: Vec::new(),
+            chests: Vec::new(),
+            fog: false,
+            stats: BattleStats::default(),
         }
     }
 
@@ -408,12 +431,14 @@ impl Battle {
                 u.spend(idx);
                 ItemUse::Healed { amount, hp_after }
             }
+            ItemKind::Key(_) => ItemUse::CannotUse,
             ItemKind::Seal => {
                 if !u.can_promote() {
                     return ItemUse::CannotUse;
                 }
                 let p = u.promote().unwrap();
                 u.spend(idx);
+                self.stats.promotions += 1;
                 ItemUse::Promoted(p)
             }
         }
@@ -434,6 +459,121 @@ impl Battle {
             }
         }
         Some(reward)
+    }
+
+    fn key_index(&self, id: usize, kind: KeyKind) -> Option<usize> {
+        self.units[id].items.iter().position(|it| it.id.info().kind == ItemKind::Key(kind))
+    }
+
+    pub fn chest_at(&self, p: Pos) -> Option<&Chest> {
+        self.chests.iter().find(|c| c.pos == p)
+    }
+
+    /// Thieves open chests freely; others need a Chest Key.
+    pub fn can_open_chest(&self, id: usize) -> bool {
+        let u = &self.units[id];
+        u.team == Team::Player && self.chest_at(u.pos).is_some_and(|c| !c.opened) && (u.class.is_thief() || self.key_index(id, KeyKind::Chest).is_some())
+    }
+
+    pub fn open_chest(&mut self, id: usize) -> Option<Reward> {
+        if !self.can_open_chest(id) {
+            return None;
+        }
+        if !self.units[id].class.is_thief() {
+            let k = self.key_index(id, KeyKind::Chest)?;
+            self.units[id].spend(k);
+        }
+        let pos = self.units[id].pos;
+        let c = self.chests.iter_mut().find(|c| c.pos == pos)?;
+        c.opened = true;
+        let reward = c.reward;
+        self.grant(id, reward);
+        self.stats.chests += 1;
+        Some(reward)
+    }
+
+    fn grant(&mut self, id: usize, reward: Reward) {
+        match reward {
+            Reward::Gold(g) => self.gold += g,
+            Reward::Item(item) => {
+                if !self.units[id].give(item) {
+                    self.gold += item.info().price / 2;
+                }
+            }
+        }
+    }
+
+    /// Locked doors next to `from` that the unit can open.
+    pub fn door_targets_from(&self, id: usize, from: Pos) -> Vec<Pos> {
+        let u = &self.units[id];
+        if u.team != Team::Player || !(u.class.is_thief() || self.key_index(id, KeyKind::Door).is_some()) {
+            return Vec::new();
+        }
+        self.map.neighbors(from).filter(|n| self.map.at(*n) == Terrain::Door).collect()
+    }
+
+    pub fn unlock(&mut self, id: usize, door: Pos) -> bool {
+        if !self.door_targets_from(id, self.units[id].pos).contains(&door) {
+            return false;
+        }
+        if !self.units[id].class.is_thief() {
+            if let Some(k) = self.key_index(id, KeyKind::Door) {
+                self.units[id].spend(k);
+            }
+        }
+        self.map.set(door, Terrain::Floor);
+        true
+    }
+
+    /// Item a thief could steal from `target`: anything but the equipped weapon.
+    pub fn stealable(&self, thief: usize, target: usize) -> Option<usize> {
+        let t = &self.units[target];
+        let th = &self.units[thief];
+        if !th.class.is_thief() || th.stats.spd < t.stats.spd || th.items.len() >= MAX_ITEMS {
+            return None;
+        }
+        let eq = t.weapon_index();
+        (0..t.items.len()).find(|i| Some(*i) != eq)
+    }
+
+    pub fn steal_targets_from(&self, id: usize, from: Pos) -> Vec<usize> {
+        let u = &self.units[id];
+        if !u.class.is_thief() {
+            return Vec::new();
+        }
+        self.units
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| t.alive && t.team.is_foe(u.team) && from.manhattan(t.pos) == 1 && self.stealable(id, *i).is_some())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn steal(&mut self, thief: usize, target: usize) -> Option<ItemId> {
+        let idx = self.stealable(thief, target)?;
+        let it = self.units[target].items.remove(idx);
+        self.units[thief].items.push(it);
+        self.stats.steals += 1;
+        Some(it.id)
+    }
+
+    /// Tiles the player can see. Without fog, everything.
+    pub fn visible(&self) -> Option<HashSet<Pos>> {
+        if !self.fog {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        for u in self.units.iter().filter(|u| u.alive && u.team == Team::Player) {
+            let r = 3 + if u.class.is_thief() || u.class.is_flying() { 2 } else { 0 };
+            seen.extend(tiles_in_range(&self.map, u.pos, 0, r));
+        }
+        Some(seen)
+    }
+
+    /// Whether the player can currently see the unit.
+    pub fn unit_visible(&self, id: usize) -> bool {
+        let u = &self.units[id];
+        u.team == Team::Player || self.visible().is_none_or(|v| v.contains(&u.pos))
     }
 
     /// The lord persuades an enemy to join.
@@ -542,7 +682,6 @@ impl Battle {
 mod tests {
     use super::*;
     use crate::logic::campaign;
-    use crate::logic::terrain::Terrain;
     use crate::logic::unit::{Class, Stats};
 
     fn plains(w: i32, h: i32) -> Map {
@@ -766,6 +905,70 @@ mod tests {
         // Partner far away: no bonus.
         bt.units[1].pos = Pos::new(7, 7);
         assert_eq!(bt.support_bonus(0, Pos::new(0, 0)), Bonus::default());
+    }
+
+    #[test]
+    fn thieves_open_chests_doors_and_steal() {
+        let rows = ["....", ".CD.", "...."];
+        let map = Map::from_rows(&rows);
+        let mut thief = Unit::generic("Pip", Class::Thief, Team::Player, 1, &[ItemId::IronSword], Pos::new(1, 1));
+        thief.stats.spd = 15;
+        let mut lancer = Unit::generic("B", Class::Lancer, Team::Player, 1, &[ItemId::IronLance], Pos::new(0, 0));
+        lancer.stats.spd = 1;
+        let mut foe = Unit::generic("F", Class::Brigand, Team::Enemy, 1, &[ItemId::IronAxe, ItemId::Vulnerary], Pos::new(1, 2));
+        foe.stats.spd = 2;
+        let mut b = Battle::new(map, vec![thief, lancer, foe], 1, true);
+        b.chests.push(Chest { pos: Pos::new(1, 1), reward: Reward::Item(ItemId::Elixir), opened: false });
+        assert!(b.can_open_chest(0));
+        assert_eq!(b.open_chest(0), Some(Reward::Item(ItemId::Elixir)));
+        assert!(!b.can_open_chest(0), "already open");
+        assert_eq!(b.door_targets_from(0, Pos::new(1, 1)), vec![Pos::new(2, 1)]);
+        assert!(b.door_targets_from(1, Pos::new(1, 0)).is_empty(), "no key, not a thief");
+        assert!(b.unlock(0, Pos::new(2, 1)));
+        assert_eq!(b.map.at(Pos::new(2, 1)), Terrain::Floor);
+        assert_eq!(b.steal_targets_from(0, Pos::new(1, 1)), vec![2]);
+        assert_eq!(b.steal(0, 2), Some(ItemId::Vulnerary));
+        assert_eq!(b.units[2].items.len(), 1, "equipped weapon can't be stolen");
+        assert!(b.steal_targets_from(0, Pos::new(1, 1)).is_empty());
+        assert_eq!((b.stats.chests, b.stats.steals), (1, 1));
+    }
+
+    #[test]
+    fn keys_let_anyone_open() {
+        let map = Map::from_rows(&["CD."]);
+        let u = Unit::generic("K", Class::Lord, Team::Player, 1, &[ItemId::IronSword, ItemId::ChestKey, ItemId::DoorKey], Pos::new(0, 0));
+        let mut b = Battle::new(map, vec![u], 1, true);
+        b.chests.push(Chest { pos: Pos::new(0, 0), reward: Reward::Gold(500), opened: false });
+        assert!(b.open_chest(0).is_some());
+        assert_eq!(b.gold, 500);
+        assert!(b.unlock(0, Pos::new(1, 0)));
+        assert_eq!(b.units[0].items.len(), 1, "both keys used up");
+    }
+
+    #[test]
+    fn fog_hides_distant_enemies() {
+        let a = Unit::generic("K", Class::Lord, Team::Player, 1, &[ItemId::IronSword], Pos::new(0, 0)).lord();
+        let near = Unit::generic("N", Class::Brigand, Team::Enemy, 1, &[ItemId::IronAxe], Pos::new(2, 0));
+        let far = Unit::generic("F", Class::Brigand, Team::Enemy, 1, &[ItemId::IronAxe], Pos::new(9, 9));
+        let mut b = Battle::new(plains(10, 10), vec![a, near, far], 1, true);
+        assert!(b.unit_visible(2), "no fog: everything visible");
+        b.fog = true;
+        assert!(b.unit_visible(1));
+        assert!(!b.unit_visible(2));
+    }
+
+    #[test]
+    fn mounted_and_flying_movement() {
+        let map = Map::from_rows(&["..M~..", "..F~.."]);
+        let cav = Unit::generic("C", Class::Cavalier, Team::Player, 1, &[ItemId::IronLance], Pos::new(0, 0));
+        let peg = Unit::generic("P", Class::PegasusKnight, Team::Player, 1, &[ItemId::IronLance], Pos::new(0, 1));
+        let b = Battle::new(map, vec![cav, peg], 1, true);
+        let rc = b.reach(0);
+        assert!(!rc.cost.contains_key(&Pos::new(2, 0)), "horses can't climb");
+        assert!(!rc.cost.contains_key(&Pos::new(3, 0)), "or swim");
+        let rp = b.reach(1);
+        assert!(rp.cost.contains_key(&Pos::new(3, 0)) && rp.cost.contains_key(&Pos::new(5, 1)), "fliers cross anything");
+        assert_eq!(rp.cost[&Pos::new(2, 0)], 3, "every tile costs 1 for fliers");
     }
 
     #[test]

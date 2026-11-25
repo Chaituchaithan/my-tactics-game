@@ -12,6 +12,10 @@ pub enum Terrain {
     Floor,
     Pillar,
     Gate,
+    /// Locked door: impassable until opened.
+    Door,
+    /// Treasure chest on a castle floor.
+    Chest,
 }
 
 /// How a unit travels; determines terrain movement costs.
@@ -21,6 +25,10 @@ pub enum MoveType {
     Infantry,
     /// Axe-wielding hill folk: cheaper mountains.
     Mountaineer,
+    /// Horse riders: fast on open ground, slowed by forest, no mountains.
+    Mounted,
+    /// Pegasus riders: everything costs 1 except walls and doors.
+    Flying,
 }
 
 impl Terrain {
@@ -38,6 +46,8 @@ impl Terrain {
             ',' => Terrain::Floor,
             'P' => Terrain::Pillar,
             'G' => Terrain::Gate,
+            'D' => Terrain::Door,
+            'C' => Terrain::Chest,
             _ => return None,
         })
     }
@@ -56,6 +66,8 @@ impl Terrain {
             Terrain::Floor => "Floor",
             Terrain::Pillar => "Pillar",
             Terrain::Gate => "Gate",
+            Terrain::Door => "Door",
+            Terrain::Chest => "Chest",
         }
     }
 
@@ -89,11 +101,17 @@ impl Terrain {
     /// Movement points needed to enter this tile, or None if impassable.
     pub fn move_cost(self, mt: MoveType) -> Option<i32> {
         match (self, mt) {
-            (Terrain::Water | Terrain::Wall, _) => None,
+            (Terrain::Wall | Terrain::Door, _) => None,
+            (_, MoveType::Flying) => Some(1),
+            (Terrain::Water, _) => None,
+            (Terrain::Mountain, MoveType::Mounted) => None,
+            (Terrain::Forest, MoveType::Mounted) => Some(3),
+            (Terrain::Pillar, MoveType::Mounted) => Some(3),
+            (Terrain::Chest, _) => Some(1),
             (Terrain::Plains | Terrain::Bridge | Terrain::Village | Terrain::Floor | Terrain::Throne | Terrain::Gate, _) => Some(1),
             (Terrain::Forest | Terrain::Fort | Terrain::Pillar, _) => Some(2),
-            (Terrain::Mountain, MoveType::Infantry) => Some(3),
             (Terrain::Mountain, MoveType::Mountaineer) => Some(2),
+            (Terrain::Mountain, _) => Some(3),
         }
     }
 }

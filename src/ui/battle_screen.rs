@@ -9,6 +9,7 @@ use std::f32::consts::PI;
 
 use macroquad::prelude::*;
 
+use super::audio;
 use super::gfx::{self, rgb, UnitLook};
 use super::widgets::*;
 use crate::logic::ai::{self, AiAction};
@@ -27,6 +28,8 @@ pub enum BattleExit {
     Victory,
     Retry,
     Title,
+    /// Leave a lost skirmish and return to camp.
+    Camp,
 }
 
 const STEP_TIME: f32 = 0.07;
@@ -83,6 +86,7 @@ enum TargetKind {
     Attack,
     Heal,
     Talk,
+    Steal,
 }
 
 enum Mode {
@@ -98,6 +102,8 @@ enum Mode {
 pub struct BattleScreen {
     b: Battle,
     chapter: usize,
+    skirmish: bool,
+    boss_music: bool,
     title: String,
     talks: Vec<(&'static str, Vec<Line>)>,
     mode: Mode,
@@ -153,14 +159,24 @@ fn team_ink(team: Team) -> Color {
 }
 
 impl BattleScreen {
-    pub fn new(mut b: Battle, chapter_index: usize, scenes: bool) -> BattleScreen {
+    /// `chapter_index` None = an optional skirmish.
+    pub fn new(mut b: Battle, chapter_index: Option<usize>, scenes: bool) -> BattleScreen {
         b.begin_phase(Phase::Player);
-        let def = chapter(chapter_index);
+        let (title, talks) = match chapter_index {
+            Some(n) => {
+                let def = chapter(n);
+                (def.title.to_string(), def.talks)
+            }
+            None => ("Skirmish".to_string(), Vec::new()),
+        };
+        let boss_music = matches!(chapter_index, Some(10) | Some(15));
         let mut s = BattleScreen {
             b,
-            chapter: chapter_index,
-            title: def.title.to_string(),
-            talks: def.talks,
+            chapter: chapter_index.unwrap_or(0),
+            skirmish: chapter_index.is_none(),
+            boss_music,
+            title,
+            talks,
             mode: Mode::Idle,
             fx: VecDeque::new(),
             fx_t: 0.0,
@@ -194,7 +210,8 @@ impl BattleScreen {
         for a in s.vis_alpha.iter_mut() {
             *a = 1.0;
         }
-        s.fx.push_back(Fx::Banner { text: format!("Chapter {}: {}", chapter_index + 1, s.title), color: ACCENT });
+        let banner = if s.skirmish { "Skirmish".to_string() } else { format!("Chapter {}: {}", s.chapter + 1, s.title) };
+        s.fx.push_back(Fx::Banner { text: banner, color: ACCENT });
         s.fx.push_back(Fx::Notice { text: s.b.objective_text(), color: ACCENT });
         s
     }
@@ -205,6 +222,21 @@ impl BattleScreen {
 
     pub fn chapter(&self) -> usize {
         self.chapter
+    }
+
+    pub fn is_skirmish(&self) -> bool {
+        self.skirmish
+    }
+
+    fn update_music(&self) {
+        let t = match (&self.mode, self.b.phase) {
+            (Mode::Over { victory: true }, _) => audio::Track::Victory,
+            (Mode::Over { victory: false }, _) => audio::Track::Story,
+            _ if self.boss_music => audio::Track::Boss,
+            (_, Phase::Player) => audio::Track::Player,
+            (_, Phase::Enemy) => audio::Track::Enemy,
+        };
+        audio::music(t);
     }
 
     /// Grows the visual arrays when units are added (reinforcements). New units start invisible.
@@ -222,6 +254,7 @@ impl BattleScreen {
         let raw_dt = get_frame_time().min(0.05);
         self.time += raw_dt;
         self.sync_vis();
+        self.update_music();
         let mut input = Input::poll();
         let mut lay = Layout::compute(self.b.map.width, self.b.map.height, self.zoom, self.cam);
 
@@ -298,7 +331,8 @@ impl BattleScreen {
             Some(Fx::Spawn { unit }) => Some(pv(self.b.units[*unit].pos)),
             _ => None,
         };
-        if let Some(p) = target {
+        let hidden = self.b.visible().is_some_and(|v| target.is_some_and(|p| !v.contains(&Pos::new(p.x as i32, p.y as i32))));
+        if let Some(p) = target.filter(|_| !hidden) {
             if self.cam_target.is_none() && !lay.shows(p, 1.5) {
                 self.cam_target = Some(lay.centred_on(p));
             }
@@ -364,10 +398,11 @@ impl BattleScreen {
         }
         self.fx_t += dt;
         let impact = if self.scene_skip { SCENE_IMPACT * 0.15 } else { SCENE_IMPACT };
-        if let Some(Fx::Strike { target, hp_after, .. }) = self.fx.front() {
+        if let Some(&Fx::Strike { target, hp_after, hit, crit, .. }) = self.fx.front() {
             if self.scene.is_some() && !self.impact_done && self.fx_t >= impact {
-                self.vis_hp[*target] = *hp_after;
+                self.vis_hp[target] = hp_after;
                 self.impact_done = true;
+                audio::sfx(if !hit { audio::Sfx::Miss } else if crit { audio::Sfx::Crit } else { audio::Sfx::Hit });
             }
         }
         let done = match self.fx_duration() {
@@ -388,6 +423,7 @@ impl BattleScreen {
                 let _ = (target, hp_after);
             }
             Fx::Strike { target, hit, crit, damage, hp_after, .. } => {
+                audio::sfx(if !hit { audio::Sfx::Miss } else if crit { audio::Sfx::Crit } else { audio::Sfx::Hit });
                 let (text, color) = if !hit {
                     ("MISS".to_string(), DIM)
                 } else if crit {
@@ -401,9 +437,12 @@ impl BattleScreen {
                 self.vis_hp[target] = hp_after;
             }
             Fx::Heal { target, amount, hp_after } => {
+                audio::sfx(audio::Sfx::Heal);
                 self.floats.push(Float { text: format!("+{}", amount), pos: self.vis_pos[target], t: 0.0, color: GOOD });
                 self.vis_hp[target] = hp_after;
             }
+            Fx::Die { .. } => audio::sfx(audio::Sfx::Death),
+            Fx::LevelUp { .. } | Fx::Promote { .. } => audio::sfx(audio::Sfx::LevelUp),
             Fx::CombatBegin { a, d, ref f } => {
                 self.combat_pair = Some((a, d));
                 if self.scenes {
@@ -566,7 +605,7 @@ impl BattleScreen {
 
     fn compute_danger(&self) -> HashSet<Pos> {
         let mut set = HashSet::new();
-        for id in self.b.living(Team::Enemy) {
+        for id in self.b.living(Team::Enemy).filter(|i| self.b.unit_visible(*i)) {
             let reach = self.b.reach(id);
             set.extend(self.b.threat_tiles(id, &reach));
         }
@@ -587,7 +626,7 @@ impl BattleScreen {
     fn tap_idle(&mut self, p: Pos) -> Mode {
         self.inspect = Some(p);
         self.inspect_range = None;
-        if let Some(id) = self.b.unit_at(p) {
+        if let Some(id) = self.b.unit_at(p).filter(|i| self.b.unit_visible(*i)) {
             let u = &self.b.units[id];
             if u.team == Team::Player && !u.done {
                 return self.select(id);
@@ -659,6 +698,12 @@ impl BattleScreen {
             TargetKind::Attack => {
                 let r = self.b.attack(unit, target);
                 self.push_combat(&r);
+            }
+            TargetKind::Steal => {
+                if let Some(item) = self.b.steal(unit, target) {
+                    audio::sfx(audio::Sfx::Steal);
+                    self.fx.push_back(Fx::Notice { text: format!("Stole a {}!", item.name()), color: GOOD });
+                }
             }
             TargetKind::Talk => {
                 let name = self.b.units[target].name.clone();
@@ -734,6 +779,12 @@ impl BattleScreen {
                     TargetKind::Attack => {
                         let f = self.b.forecast(*unit, *t);
                         self.forecast_box(inner.x, y, inner.w, u, *unit, *t, &f);
+                    }
+                    TargetKind::Steal => {
+                        text_centered("Steal", inner.x + inner.w / 2.0, y, u * 0.9, ACCENT);
+                        let item = self.b.stealable(*unit, *t).map(|i| self.b.units[*t].items[i].name()).unwrap_or_default();
+                        text_centered(&item, inner.x + inner.w / 2.0, y + u * 1.5, u * 1.1, GOOD);
+                        text_centered(&format!("from {}", self.b.units[*t].name), inner.x + inner.w / 2.0, y + u * 2.8, u * 0.75, DIM);
                     }
                     TargetKind::Talk => {
                         text_centered("Talk", inner.x + inner.w / 2.0, y, u * 0.9, ACCENT);
@@ -838,6 +889,33 @@ impl BattleScreen {
                     self.b.finish_action(unit);
                     next = Some(Mode::Idle);
                 }
+                if self.b.can_open_chest(unit) && button(input, col.next(), "Open", ButtonStyle::Primary, u) {
+                    if let Some(rw) = self.b.open_chest(unit) {
+                        audio::sfx(audio::Sfx::Chest);
+                        let t = match rw {
+                            Reward::Gold(g) => format!("The chest holds {} gold.", g),
+                            Reward::Item(i) => format!("The chest holds a {}.", i.name()),
+                        };
+                        self.fx.push_back(Fx::Say { speaker: String::new(), text: t });
+                    }
+                    self.b.finish_action(unit);
+                    next = Some(Mode::Idle);
+                }
+                let doors = self.b.door_targets_from(unit, pos);
+                if !doors.is_empty() && button(input, col.next(), "Unlock", ButtonStyle::Primary, u) {
+                    for d in doors {
+                        self.b.unlock(unit, d);
+                    }
+                    audio::sfx(audio::Sfx::Door);
+                    self.fx.push_back(Fx::Notice { text: "The door swings open.".into(), color: INK });
+                    self.b.finish_action(unit);
+                    self.danger = None;
+                    next = Some(Mode::Idle);
+                }
+                let steals = self.b.steal_targets_from(unit, pos);
+                if !steals.is_empty() && button(input, col.next(), "Steal", ButtonStyle::Primary, u) {
+                    next = Some(Mode::Target { unit, from, chosen: steals.first().copied(), targets: steals, kind: TargetKind::Steal });
+                }
                 if self.b.can_seize(unit) && button(input, col.next(), "Seize", ButtonStyle::Primary, u) {
                     self.b.seize(unit);
                     self.b.finish_action(unit);
@@ -889,6 +967,7 @@ impl BattleScreen {
                                     ItemKind::Seal => "Needs level 10 or higher.",
                                     ItemKind::Heal(_) => "HP is already full.",
                                     ItemKind::Weapon(_) => "Can't wield that.",
+                                    ItemKind::Key(_) => "Stand next to a door or on a chest.",
                                 };
                                 self.fx.push_back(Fx::Notice { text: why.into(), color: DIM });
                             }
@@ -906,6 +985,7 @@ impl BattleScreen {
                     TargetKind::Attack => "Attack!",
                     TargetKind::Heal => "Heal!",
                     TargetKind::Talk => "Talk!",
+                    TargetKind::Steal => "Steal!",
                 };
                 if button(input, col.next(), label, ButtonStyle::Primary, u) {
                     return self.execute(unit, t, kind);
@@ -1129,7 +1209,7 @@ impl BattleScreen {
             for x in vx0..=vx1 {
                 let p = Pos::new(x, y);
                 let r = lay.tile_rect(x as f32, y as f32);
-                let visited = self.b.village_at(p).is_some_and(|v| v.visited);
+                let visited = self.b.village_at(p).is_some_and(|v| v.visited) || self.b.chest_at(p).is_some_and(|c| c.opened);
                 gfx::draw_terrain(m.at(p), r.x, r.y, r.w, x, y, self.time, visited);
             }
         }
@@ -1150,6 +1230,19 @@ impl BattleScreen {
             let a = 0.5 + 0.5 * (self.time * 3.0).sin();
             let r = lay.tile_rect(p.x as f32, p.y as f32);
             draw_rectangle_lines(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 4.0, 3.0, Color::new(1.0, 0.85, 0.3, a));
+        }
+
+        // Fog of war
+        if let Some(seen) = self.b.visible() {
+            for y in vy0..=vy1 {
+                for x in vx0..=vx1 {
+                    let p = Pos::new(x, y);
+                    if !seen.contains(&p) {
+                        let r = lay.tile_rect(x as f32, y as f32);
+                        draw_rectangle(r.x, r.y, r.w + 1.0, r.h + 1.0, Color::new(0.02, 0.03, 0.08, 0.55));
+                    }
+                }
+            }
         }
 
         if let (Some(d), true) = (&self.danger, self.show_danger) {
@@ -1182,6 +1275,7 @@ impl BattleScreen {
                     TargetKind::Attack => Color::new(1.0, 0.2, 0.2, 0.42 + pulse),
                     TargetKind::Heal => Color::new(0.2, 0.95, 0.4, 0.4 + pulse),
                     TargetKind::Talk => Color::new(0.3, 0.7, 1.0, 0.42 + pulse),
+                    TargetKind::Steal => Color::new(1.0, 0.85, 0.2, 0.42 + pulse),
                 };
                 for t in targets {
                     self.shade(lay, self.b.units[*t].pos, c);
@@ -1197,7 +1291,7 @@ impl BattleScreen {
         order.sort_by(|a, b| self.draw_pos(*a).y.partial_cmp(&self.draw_pos(*b).y).unwrap_or(std::cmp::Ordering::Equal));
         for i in order {
             let alpha = self.draw_alpha(i);
-            if alpha <= 0.0 {
+            if alpha <= 0.0 || (self.vis_team[i] == Team::Enemy && !self.b.unit_visible(i)) {
                 continue;
             }
             let un = &self.b.units[i];
@@ -1575,6 +1669,10 @@ impl BattleScreen {
         if victory {
             if button(input, Rect::new(r.x + u, by, w - u * 2.0, bh), "Continue", ButtonStyle::Primary, u) {
                 exit = BattleExit::Victory;
+            }
+        } else if self.skirmish {
+            if button(input, Rect::new(r.x + u, by, w - u * 2.0, bh), "Retreat to Camp", ButtonStyle::Primary, u) {
+                exit = BattleExit::Camp;
             }
         } else {
             if button(input, Rect::new(r.x + u, by, bw, bh), "Retry Chapter", ButtonStyle::Primary, u) {

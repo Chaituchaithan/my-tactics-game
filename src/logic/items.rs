@@ -35,6 +35,8 @@ pub enum ItemId {
     Vulnerary,
     Elixir,
     MasterSeal,
+    DoorKey,
+    ChestKey,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,7 +47,17 @@ pub enum ItemKind {
     Heal(i32),
     /// Promotes a unit of level 10 or higher.
     Seal,
+    Key(KeyKind),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyKind {
+    Door,
+    Chest,
+}
+
+/// Forge levels a weapon can take; each adds +1 Mt, +5 Hit, +3 Crit.
+pub const MAX_FORGE: u8 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ItemInfo {
@@ -91,6 +103,8 @@ impl ItemId {
             Vulnerary => ("Vulnerary", 3, 300, ItemKind::Heal(10)),
             Elixir => ("Elixir", 1, 900, ItemKind::Heal(99)),
             MasterSeal => ("Master Seal", 1, 2500, ItemKind::Seal),
+            DoorKey => ("Door Key", 1, 300, ItemKind::Key(KeyKind::Door)),
+            ChestKey => ("Chest Key", 1, 400, ItemKind::Key(KeyKind::Chest)),
         };
         ItemInfo { name, uses, price, kind }
     }
@@ -113,6 +127,8 @@ impl ItemId {
             ItemKind::Heal(99) => "Fully restores HP.".into(),
             ItemKind::Heal(n) => format!("Restores {} HP.", n),
             ItemKind::Seal => "Promotes a unit of Lv 10+.".into(),
+            ItemKind::Key(KeyKind::Door) => "Opens one locked door.".into(),
+            ItemKind::Key(KeyKind::Chest) => "Opens one treasure chest.".into(),
         }
     }
 }
@@ -134,21 +150,68 @@ pub const SHOP: &[ItemId] = &[
     ItemId::Ember,
     ItemId::Blaze,
     ItemId::Mend,
+    ItemId::DoorKey,
+    ItemId::ChestKey,
     ItemId::MasterSeal,
 ];
+
+/// Extra stock unlocked as the campaign goes on.
+pub fn shop_for(chapter: usize) -> Vec<ItemId> {
+    let mut v = SHOP.to_vec();
+    if chapter >= 6 {
+        v.extend([ItemId::SilverSword, ItemId::SilverLance, ItemId::SilverAxe, ItemId::Longbow, ItemId::Renew]);
+    }
+    if chapter >= 10 {
+        v.extend([ItemId::KeenSword, ItemId::Inferno]);
+    }
+    v
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: ItemId,
     pub uses: i32,
+    /// Forge level (weapons only).
+    #[serde(default)]
+    pub forge: u8,
 }
 
 impl Item {
     pub fn new(id: ItemId) -> Item {
-        Item { id, uses: id.info().uses }
+        Item { id, uses: id.info().uses, forge: 0 }
+    }
+
+    pub fn name(&self) -> String {
+        if self.forge > 0 {
+            format!("{}+{}", self.id.name(), self.forge)
+        } else {
+            self.id.name().to_string()
+        }
     }
 
     pub fn label(&self) -> String {
-        format!("{} {}/{}", self.id.name(), self.uses, self.id.info().uses)
+        format!("{} {}/{}", self.name(), self.uses, self.id.info().uses)
+    }
+
+    /// Weapon stats including forge bonuses.
+    pub fn weapon(&self) -> Option<Weapon> {
+        let mut w = self.id.weapon()?;
+        if w.can_attack() {
+            let f = self.forge as i32;
+            w.might += f;
+            w.hit += 5 * f;
+            w.crit += 3 * f;
+        }
+        Some(w)
+    }
+
+    pub fn can_forge(&self) -> bool {
+        self.forge < MAX_FORGE && self.id.weapon().is_some_and(|w| w.can_attack())
+    }
+
+    /// Gold cost of the next forge level.
+    pub fn forge_cost(&self) -> i32 {
+        let base = self.id.info().price.max(600);
+        base / 2 + 250 * (self.forge as i32 + 1)
     }
 }

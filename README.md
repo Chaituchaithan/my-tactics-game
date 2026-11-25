@@ -32,6 +32,24 @@ Map sizes: Small 16×12, Medium 22×15, Large 28×18, Extra Large 34×22. Enemy 
 
 **Supports:** 10 pairs of allies (Kael & Brenna, Orrin & Ilse, Tamsin & Corvin and others) build bonds when they end turns within 2 tiles of each other. Each new level (C, B, A) unlocks a conversation in **Supports** on the preparations screen. In battle, each level gives +5 Hit, +5 Avoid, +2 Crit and +2 crit-dodge while the partner is within 3 tiles. The bonus is already included in the forecast.
 
+**More systems:**
+- **Music and sound:** original chiptune tracks (title, story, player phase, enemy phase, boss, victory) and sound effects. Everything is synthesised in code at startup (`ui/audio.rs`), so there are no audio files. Toggle music and effects in **Settings** on the title screen.
+- **Difficulty:** Easy, Normal or Hard, chosen at New Game. It scales enemy stats.
+- **Mounted and flying units:**
+  - Cavaliers and Paladins (Garrett joins in chapter 3) move 7–8 tiles, but forest costs them 3 and they can't climb mountains.
+  - Pegasus and Falcon Knights (Skye joins in chapter 6) fly over water and mountains but get no terrain bonuses.
+  - Bows deal triple might to fliers.
+  - Enemy riders and fliers appear from chapter 5 on.
+- **Thieves, chests and doors:**
+  - Pip the Thief joins in chapter 4. Thieves can **Steal** an unequipped item from a slower enemy.
+  - Castles have locked **doors** and treasure **chests**. Thieves open both for free; anyone else needs a Door Key or Chest Key (sold in the shop).
+- **Fog of war:** in chapters 5, 12 and 14 you only see near your units. Thieves and fliers see farther.
+- **Skirmish:** optional generated battles from camp for experience and gold. Losing one costs nothing.
+- **Arena:** bet gold on a one-on-one duel. A win doubles the bet and gives EXP; a loss costs only the bet.
+- **Forge:** pay gold to raise a weapon up to +5. Each level adds +1 Mt, +5 Hit and +3 Crit.
+- **Achievements:** 16 to earn (viewable from the title screen), with pop-ups when unlocked.
+- **New Game+:** after the ending, start again with your levelled army, gold and bonds against tougher enemies.
+
 **Art:** every sprite, portrait and tile is pixel art drawn in code: 32×32 units with outlines and 3-tone shading, varied hair and skin per character, 48×48 face portraits, and detailed terrain. Sprites are cached as textures.
 
 Between chapters you get a **story scene** and a **preparations screen**: army and inventories (equip, discard, give items, use Master Seals, reorder who deploys) and an **armory** that sells weapons, staves and consumables. Progress **auto-saves** before each battle. Choose **Continue** on the title screen to resume.
@@ -74,7 +92,8 @@ src/ui/           macroquad rendering and input
   battle_screen.rs input state machine, animation queue, panel, forecast
   story.rs        dialogue scenes
   prep.rs         preparations: army, items, shop
-  storage.rs      save file
+  storage.rs      save file and profile
+  audio.rs        synthesised music and sound effects
   widgets.rs      layout, buttons, tap input
 ```
 
@@ -82,7 +101,7 @@ src/ui/           macroquad rendering and input
 
 ```sh
 cargo run --release   # play
-cargo test            # 80 tests: combat, pathfinding, AI, items, maps, supports, campaign
+cargo test            # 98 tests: combat, pathfinding, AI, items, maps, supports, campaign, profile, audio
 cargo test --release -- --ignored --nocapture   # auto-battle all 16 chapters
 ```
 

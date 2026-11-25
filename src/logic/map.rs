@@ -47,6 +47,13 @@ impl Map {
     }
 
 
+    pub fn set(&mut self, p: Pos, t: Terrain) {
+        if self.in_bounds(p) {
+            let w = self.width;
+            self.tiles[(p.y * w + p.x) as usize] = t;
+        }
+    }
+
     pub fn neighbors(&self, p: Pos) -> impl Iterator<Item = Pos> + '_ {
         [(1, 0), (-1, 0), (0, 1), (0, -1)]
             .into_iter()

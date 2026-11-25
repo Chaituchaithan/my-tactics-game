@@ -98,6 +98,9 @@ pub enum Class {
     Archer,
     Mage,
     Cleric,
+    Cavalier,
+    PegasusKnight,
+    Thief,
     // Promoted classes
     Highlord,
     Hero,
@@ -107,6 +110,9 @@ pub enum Class {
     Sniper,
     Sage,
     Bishop,
+    Paladin,
+    FalconKnight,
+    Rogue,
     // Enemy-only bosses
     Warlord,
     Sorcerer,
@@ -140,6 +146,9 @@ impl Class {
             Archer => ("Archer", &[Bow], 5, Infantry, s(17, 5, 6, 5, 2, 3, 2), s(70, 45, 50, 45, 30, 20, 20), Some(Sniper), false),
             Mage => ("Mage", &[Magic], 5, Infantry, s(16, 6, 5, 5, 2, 2, 5), s(55, 55, 45, 45, 25, 15, 40), Some(Sage), false),
             Cleric => ("Cleric", &[Staff], 5, Infantry, s(15, 5, 3, 6, 6, 1, 7), s(50, 50, 30, 50, 55, 10, 55), Some(Bishop), false),
+            Cavalier => ("Cavalier", &[Sword, Lance], 7, Mounted, s(20, 6, 5, 6, 3, 6, 1), s(80, 45, 40, 45, 35, 30, 15), Some(Paladin), false),
+            PegasusKnight => ("Pegasus Knight", &[Lance], 7, Flying, s(16, 5, 6, 8, 5, 4, 6), s(60, 40, 45, 60, 50, 15, 40), Some(FalconKnight), false),
+            Thief => ("Thief", &[Sword], 6, Infantry, s(16, 4, 6, 9, 4, 2, 1), s(60, 35, 50, 60, 45, 15, 20), Some(Rogue), false),
             Highlord => ("Highlord", &[Sword, Lance], 6, Infantry, s(24, 8, 9, 10, 6, 8, 5), s(80, 45, 50, 55, 45, 30, 25), None, true),
             Hero => ("Hero", &[Sword, Axe], 6, Infantry, s(26, 8, 11, 10, 3, 7, 3), s(80, 40, 45, 45, 25, 25, 15), None, true),
             Halberdier => ("Halberdier", &[Lance, Sword], 6, Infantry, s(26, 9, 7, 8, 3, 9, 3), s(85, 45, 35, 35, 25, 35, 10), None, true),
@@ -148,6 +157,9 @@ impl Class {
             Sniper => ("Sniper", &[Bow, Sword], 6, Infantry, s(22, 7, 10, 8, 3, 6, 4), s(70, 45, 50, 45, 30, 20, 20), None, true),
             Sage => ("Sage", &[Magic, Staff], 6, Infantry, s(21, 9, 8, 8, 3, 4, 8), s(55, 55, 45, 45, 25, 15, 40), None, true),
             Bishop => ("Bishop", &[Staff, Magic], 6, Infantry, s(20, 8, 5, 8, 7, 3, 10), s(50, 50, 30, 50, 55, 10, 55), None, true),
+            Paladin => ("Paladin", &[Sword, Lance, Axe], 8, Mounted, s(26, 9, 8, 9, 4, 9, 4), s(80, 45, 40, 45, 35, 30, 15), None, true),
+            FalconKnight => ("Falcon Knight", &[Lance, Sword], 8, Flying, s(22, 8, 10, 12, 6, 6, 9), s(60, 40, 45, 60, 50, 15, 40), None, true),
+            Rogue => ("Rogue", &[Sword], 7, Infantry, s(22, 7, 11, 13, 6, 5, 4), s(60, 35, 50, 60, 45, 15, 20), None, true),
             Warlord => ("Warlord", &[Axe, Sword], 6, Mountaineer, s(30, 10, 8, 7, 3, 8, 3), s(80, 45, 30, 30, 20, 30, 15), None, true),
             Sorcerer => ("Sorcerer", &[Magic], 5, Infantry, s(30, 12, 10, 8, 5, 7, 12), s(60, 55, 40, 40, 30, 25, 45), None, true),
         };
@@ -174,6 +186,15 @@ impl Class {
         self.info().kinds.contains(&kind)
     }
 
+    pub fn is_flying(self) -> bool {
+        self.info().move_type == MoveType::Flying
+    }
+
+    /// Thieves pick locks and steal.
+    pub fn is_thief(self) -> bool {
+        matches!(self, Class::Thief | Class::Rogue)
+    }
+
     pub fn uses_magic(self) -> bool {
         self.info().kinds.iter().any(|k| k.is_magic())
     }
@@ -190,6 +211,9 @@ impl Class {
             Sniper => Archer,
             Sage => Mage,
             Bishop => Cleric,
+            Paladin => Cavalier,
+            FalconKnight => PegasusKnight,
+            Rogue => Thief,
             c => c,
         }
     }
@@ -357,7 +381,7 @@ impl Unit {
     pub fn can_use(&self, id: ItemId) -> bool {
         match id.info().kind {
             ItemKind::Weapon(w) => self.class.can_wield(w.kind),
-            ItemKind::Heal(_) => true,
+            ItemKind::Heal(_) | ItemKind::Key(_) => true,
             ItemKind::Seal => self.class.info().promotes_to.is_some(),
         }
     }
@@ -367,7 +391,7 @@ impl Unit {
         self.items
             .iter()
             .enumerate()
-            .filter_map(|(i, it)| it.id.weapon().filter(|w| w.can_attack() && self.class.can_wield(w.kind)).map(|w| (i, w)))
+            .filter_map(|(i, it)| it.weapon().filter(|w| w.can_attack() && self.class.can_wield(w.kind)).map(|w| (i, w)))
             .collect()
     }
 
@@ -385,7 +409,7 @@ impl Unit {
     }
 
     pub fn staff(&self) -> Option<Weapon> {
-        self.staff_index().and_then(|i| self.items[i].id.weapon())
+        self.staff_index().and_then(|i| self.items[i].weapon())
     }
 
     /// Combined min/max attack range over all usable weapons.

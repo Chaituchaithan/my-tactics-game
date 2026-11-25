@@ -25,7 +25,13 @@ fn window_conf() -> Conf {
 async fn main() {
     // We read touches directly; don't also synthesize mouse clicks from them.
     simulate_mouse_with_touch(false);
-    let mut app = ui::App::new();
+    clear_background(Color::from_rgba(16, 16, 30, 255));
+    draw_text("Loading...", 40.0, screen_height() / 2.0, 40.0, WHITE);
+    next_frame().await;
+    let profile = ui::storage::load_profile();
+    let (music, sfx) = ui::App::music_enabled(&profile);
+    ui::audio::init(music, sfx).await;
+    let mut app = ui::App::new(profile);
     #[cfg(not(target_os = "android"))]
     let mut script = debug_script::Script::from_env();
     loop {

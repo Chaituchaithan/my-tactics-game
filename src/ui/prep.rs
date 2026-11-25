@@ -7,12 +7,14 @@ use super::widgets::*;
 use super::battle_screen::dialogue_box;
 use crate::logic::campaign::{Campaign, Line};
 use crate::logic::supports::{self, THRESHOLDS};
-use crate::logic::items::{ItemKind, MAX_ITEMS, SHOP};
+use crate::logic::items::{shop_for, ItemKind, MAX_FORGE, MAX_ITEMS};
+use crate::logic::profile::Profile;
 use crate::logic::unit::{Unit, STAT_NAMES};
 
 pub enum PrepExit {
     Stay,
     Begin,
+    Skirmish,
     Title,
 }
 
@@ -22,6 +24,8 @@ enum Tab {
     Army,
     Shop,
     Supports,
+    Arena,
+    Forge,
 }
 
 pub struct PrepScreen {
@@ -35,18 +39,20 @@ pub struct PrepScreen {
     info: Option<(usize, usize, String, String)>,
     /// Support conversation being shown: (lines, index, time on line).
     convo: Option<(Vec<Line>, usize, f32)>,
+    /// Last arena bout's log.
+    arena_log: Vec<String>,
 }
 
 impl PrepScreen {
     pub fn new() -> PrepScreen {
-        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0, info: None, convo: None }
+        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0, info: None, convo: None, arena_log: Vec::new() }
     }
 
     fn say(&mut self, s: impl Into<String>) {
         self.msg = Some((s.into(), 2.0));
     }
 
-    pub fn frame(&mut self, c: &mut Campaign) -> PrepExit {
+    pub fn frame(&mut self, c: &mut Campaign, profile: &mut Profile) -> PrepExit {
         let dt = get_frame_time().min(0.05);
         self.time += dt;
         if let Some((_, t)) = &mut self.msg {
@@ -95,7 +101,7 @@ impl PrepScreen {
         let exit = match self.tab {
             Tab::Main => self.main(c, &mut input, left, right, u, slots, &objective, &size),
             Tab::Army => {
-                self.army(c, &mut input, left, right, u, slots);
+                self.army(c, profile, &mut input, left, right, u, slots);
                 PrepExit::Stay
             }
             Tab::Shop => {
@@ -104,6 +110,14 @@ impl PrepScreen {
             }
             Tab::Supports => {
                 self.supports(c, &mut input, left, right, u);
+                PrepExit::Stay
+            }
+            Tab::Arena => {
+                self.arena(c, profile, &mut input, left, right, u, slots);
+                PrepExit::Stay
+            }
+            Tab::Forge => {
+                self.forge(c, &mut input, left, right, u, slots);
                 PrepExit::Stay
             }
         };
@@ -137,7 +151,8 @@ impl PrepScreen {
         text(&format!("Gold: {}", c.gold), left.x + u, y, u * 0.85, ACCENT);
         y += u * 1.0;
         let mode = if c.permadeath { "Permadeath: ON" } else { "Permadeath: OFF" };
-        text(mode, left.x + u, y, u * 0.8, if c.permadeath { BAD } else { DIM });
+        let ng = if c.ng_plus > 0 { format!("   New Game+{}", c.ng_plus) } else { String::new() };
+        text(&format!("{}   {}{}", mode, c.difficulty.name(), ng), left.x + u, y, u * 0.8, if c.permadeath { BAD } else { DIM });
         y += u * 1.4;
         let dep = c.deployment(slots);
         let size = (u * 2.6).min((left.w - u * 2.0) / 6.0);
@@ -155,35 +170,52 @@ impl PrepScreen {
             x += size + u * 0.2;
         }
 
-        let mut col = ButtonColumn::new(right, u);
+        let mut col = ButtonColumn::grid(right, u, 2);
         let mut exit = PrepExit::Stay;
+        // Bottom-up, two per row.
         if button(input, col.next(), "Save & Quit", ButtonStyle::Normal, u) {
             exit = PrepExit::Title;
         }
-        let scenes = if c.battle_scenes { "Battle Scenes: On" } else { "Battle Scenes: Off" };
+        let scenes = if c.battle_scenes { "Scenes: On" } else { "Scenes: Off" };
         if button(input, col.next(), scenes, ButtonStyle::Normal, u) {
             c.battle_scenes = !c.battle_scenes;
         }
+        if button(input, col.next(), "Arena", ButtonStyle::Normal, u) {
+            self.tab = Tab::Arena;
+            self.arena_log.clear();
+        }
+        if button(input, col.next(), "Forge", ButtonStyle::Normal, u) {
+            self.tab = Tab::Forge;
+            self.item = None;
+        }
         let ready = c.support_list().iter().filter(|s| s.ready()).count();
-        let label = if ready > 0 { format!("Supports ({} new!)", ready) } else { "Supports".to_string() };
+        let label = if ready > 0 { format!("Supports ({})", ready) } else { "Supports".to_string() };
         if button(input, col.next(), &label, if ready > 0 { ButtonStyle::Primary } else { ButtonStyle::Normal }, u) {
             self.tab = Tab::Supports;
         }
-        if button(input, col.next(), "Shop", ButtonStyle::Normal, u) {
-            self.tab = Tab::Shop;
+        if button(input, col.next(), "Skirmish", ButtonStyle::Normal, u) {
+            exit = PrepExit::Skirmish;
         }
         if button(input, col.next(), "Army & Items", ButtonStyle::Normal, u) {
             self.tab = Tab::Army;
             self.item = None;
         }
-        if button(input, col.next(), "Begin Battle", ButtonStyle::Primary, u) {
+        if button(input, col.next(), "Shop", ButtonStyle::Normal, u) {
+            self.tab = Tab::Shop;
+        }
+        let r = col.next();
+        let r2 = col.next();
+        let begin = Rect::new(r.x, r.y, r2.x + r2.w - r.x, r.h);
+        if button(input, begin, "Begin Battle", ButtonStyle::Primary, u) {
             exit = PrepExit::Begin;
         }
         let top = col.top();
         let notes = [
             "Units heal fully between chapters.",
-            "Level 10+ units can promote",
-            "with a Master Seal.",
+            "Skirmishes: optional battles for",
+            "experience and gold.",
+            "Arena: bet gold on a duel.",
+            "Forge: strengthen a weapon.",
             "Units at the top of the army",
             "list are deployed first.",
         ];
@@ -218,7 +250,8 @@ impl PrepScreen {
         }
     }
 
-    fn army(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn army(&mut self, c: &mut Campaign, profile: &mut Profile, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize) {
         text("Army", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
         self.unit_list(c, input, left, u, slots);
         if c.army.is_empty() {
@@ -287,6 +320,7 @@ impl PrepScreen {
                             let p = c.army[self.unit].promote().unwrap();
                             c.army[self.unit].spend(i);
                             c.army[self.unit].hp = c.army[self.unit].stats.hp;
+                            profile.promotions += 1;
                             self.item = None;
                             self.say(format!("{} became a {}!", c.army[self.unit].name, p.to.name()));
                         } else {
@@ -294,7 +328,7 @@ impl PrepScreen {
                         }
                     }
                 }
-                ItemKind::Heal(_) => {}
+                ItemKind::Heal(_) | ItemKind::Key(_) => {}
             }
         }
     }
@@ -367,14 +401,115 @@ impl PrepScreen {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn arena(&mut self, c: &mut Campaign, profile: &mut Profile, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize) {
+        text("Arena", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
+        text_right(&format!("{} G", c.gold), left.x + left.w, left.y + u * 1.4, u, ACCENT);
+        self.unit_list(c, input, left, u, slots);
+        if c.army.is_empty() {
+            return;
+        }
+        frame(right);
+        let x = right.x + u;
+        let w = right.w - u * 2.0;
+        let mut y = unit_sheet(&c.army[self.unit], x, right.y + u * 1.6, w, u, self.time);
+        let bet = c.arena_bet(self.unit);
+        text(&format!("Bet: {} G. Win to double it and gain EXP.", bet), x, y, u * 0.75, INK);
+        y += u * 0.9;
+        text("Losing costs only the bet, never the unit.", x, y, u * 0.65, DIM);
+        y += u * 1.2;
+        for line in self.arena_log.iter().rev().take(6).collect::<Vec<_>>().into_iter().rev() {
+            text(line, x, y, u * 0.7, if line.starts_with("Victory") { GOOD } else { INK });
+            y += u * 0.9;
+        }
+        let mut col = ButtonColumn::grid(Rect::new(x, right.y, w, right.h - u * 0.8), u, 2);
+        if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
+            self.tab = Tab::Main;
+            return;
+        }
+        let can = c.gold >= bet && c.army[self.unit].weapon().is_some();
+        if button(input, col.next(), &format!("Fight ({}G)", bet), if can { ButtonStyle::Primary } else { ButtonStyle::Disabled }, u) {
+            let seed = (macroquad::miniquad::date::now() * 1000.0) as u64;
+            if let Some(res) = c.arena(self.unit, seed) {
+                let _ = res.bet;
+                if res.won {
+                    profile.arena_wins += 1;
+                    super::audio::sfx(super::audio::Sfx::LevelUp);
+                }
+                self.arena_log = res.log;
+                if let Some(lv) = res.level_up {
+                    self.arena_log.push(format!("{} reached level {}!", c.army[self.unit].name, lv.new_level));
+                }
+            }
+        }
+    }
+
+    fn forge(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize) {
+        text("Forge", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
+        text_right(&format!("{} G", c.gold), left.x + left.w, left.y + u * 1.4, u, ACCENT);
+        self.unit_list(c, input, left, u, slots);
+        if c.army.is_empty() {
+            return;
+        }
+        frame(right);
+        let x = right.x + u;
+        let w = right.w - u * 2.0;
+        let mut y = right.y + u * 1.8;
+        text(&format!("{}'s weapons", c.army[self.unit].name), x, y, u, ALLY);
+        y += u * 0.8;
+        let items = c.army[self.unit].items.clone();
+        for (i, it) in items.iter().enumerate() {
+            if !it.id.weapon().is_some_and(|w| w.can_attack()) {
+                continue;
+            }
+            let r = Rect::new(x, y, w, u * 1.7);
+            let style = if self.item == Some(i) { ButtonStyle::Primary } else { ButtonStyle::Normal };
+            if button(input, r, &it.label(), style, u * 0.8) {
+                self.item = Some(i);
+            }
+            y += u * 1.9;
+        }
+        y += u * 0.4;
+        let mut col = ButtonColumn::grid(Rect::new(x, right.y, w, right.h - u * 0.8), u, 2);
+        if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
+            self.tab = Tab::Main;
+            return;
+        }
+        if let Some(i) = self.item.filter(|i| *i < c.army[self.unit].items.len()) {
+            let it = c.army[self.unit].items[i];
+            if let Some(wp) = it.weapon() {
+                text(&format!("Now:  Mt {}  Hit {}  Crt {}   (+{}/{})", wp.might, wp.hit, wp.crit, it.forge, MAX_FORGE), x, y + u * 0.6, u * 0.75, INK);
+                if it.can_forge() {
+                    text(&format!("Next: Mt {}  Hit {}  Crt {}", wp.might + 1, wp.hit + 5, wp.crit + 3), x, y + u * 1.6, u * 0.75, GOOD);
+                    let cost = it.forge_cost();
+                    let st = if c.gold >= cost { ButtonStyle::Primary } else { ButtonStyle::Disabled };
+                    if button(input, col.next(), &format!("Forge ({}G)", cost), st, u) {
+                        match c.forge(self.unit, i) {
+                            Ok(_) => {
+                                super::audio::sfx(super::audio::Sfx::Chest);
+                                self.say(format!("Forged {}!", c.army[self.unit].items[i].name()));
+                            }
+                            Err(e) => self.say(e),
+                        }
+                    }
+                } else {
+                    text("Fully forged.", x, y + u * 1.6, u * 0.75, ACCENT);
+                }
+            }
+        } else {
+            text("Pick a weapon to strengthen.", x, y + u * 0.6, u * 0.75, DIM);
+        }
+    }
+
     fn shop(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32) {
+        let stock = shop_for(c.chapter);
         text("Armory", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
         text_right(&format!("{} G", c.gold), left.x + left.w, left.y + u * 1.4, u, ACCENT);
         let cols = 2;
-        let rows = SHOP.len().div_ceil(cols);
+        let rows = stock.len().div_ceil(cols);
         let bh = ((left.h - u * 2.6) / rows as f32 - u * 0.2).min(u * 2.0);
         let bw = (left.w - u * 0.4) / 2.0;
-        for (i, id) in SHOP.iter().enumerate() {
+        for (i, id) in stock.iter().enumerate() {
             let col = i / rows;
             let row = i % rows;
             let r = Rect::new(left.x + col as f32 * (bw + u * 0.4), left.y + u * 2.4 + row as f32 * (bh + u * 0.2), bw, bh);
@@ -387,7 +522,7 @@ impl PrepScreen {
         frame(right);
         let x = right.x + u;
         let w = right.w - u * 2.0;
-        let id = SHOP[self.shop_item];
+        let id = stock[self.shop_item.min(stock.len() - 1)];
         let mut y = right.y + u * 1.8;
         text(id.name(), x, y, u * 1.2, ACCENT);
         text_right(&format!("{} G", id.info().price), x + w, y, u, INK);

@@ -57,6 +57,9 @@ impl Area {
 
 pub struct Generated {
     pub map: Map,
+    /// Chest tiles (also marked on the map).
+    #[allow(dead_code)]
+    pub chests: Vec<Pos>,
     pub starts: Vec<Pos>,
     pub throne: Option<Pos>,
     pub castle: Option<Area>,
@@ -125,6 +128,11 @@ impl Grid {
 }
 
 fn reach_from(g: &Grid, start: Pos) -> HashSet<Pos> {
+    reach_with(g, start, false)
+}
+
+/// Flood fill; `doors_open` treats locked doors as passable.
+fn reach_with(g: &Grid, start: Pos, doors_open: bool) -> HashSet<Pos> {
     let mut seen = HashSet::new();
     let mut q = VecDeque::new();
     seen.insert(start);
@@ -132,7 +140,9 @@ fn reach_from(g: &Grid, start: Pos) -> HashSet<Pos> {
     while let Some(p) = q.pop_front() {
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             let n = Pos::new(p.x + dx, p.y + dy);
-            if g.inb(n.x, n.y) && g.get(n.x, n.y).move_cost(MoveType::Infantry).is_some() && seen.insert(n) {
+            let t = if g.inb(n.x, n.y) { g.get(n.x, n.y) } else { Terrain::Wall };
+            let ok = t.move_cost(MoveType::Infantry).is_some() || (doors_open && t == Terrain::Door);
+            if g.inb(n.x, n.y) && ok && seen.insert(n) {
                 q.push_back(n);
             }
         }
@@ -159,9 +169,11 @@ fn build_castle(g: &mut Grid, rng: &mut Rng, a: Area, gate_left: bool, rooms: bo
         let h = a.y1 - a.y0 - 1;
         let d1 = a.y0 + 1 + (rng.percent() % (h / 2).max(1));
         let d2 = a.y1 - 1 - (rng.percent() % (h / 2).max(1));
-        for d in [d1, d2, cy] {
-            g.set(x, d, Terrain::Floor);
+        for d in [d1, d2] {
+            // Side passages are sometimes locked.
+            g.set(x, d, if rng.roll(45) { Terrain::Door } else { Terrain::Floor });
         }
+        g.set(x, cy, Terrain::Floor);
         x += step;
     }
     if rooms {
@@ -368,12 +380,37 @@ pub fn generate(spec: &MapSpec) -> Generated {
         }
     }
 
+    // Treasure chests in castle rooms (possibly behind locked doors).
+    let mut chests = Vec::new();
+    if let Some(c) = castle {
+        let open = reach_with(&g, starts[0], true);
+        let cy = (c.y0 + c.y1) / 2;
+        let mut spots: Vec<Pos> = open
+            .iter()
+            .copied()
+            .filter(|p| c.contains(*p) && g.get(p.x, p.y) == Terrain::Floor && p.y != cy && p.y != cy - 1 && throne.is_none_or(|t| t.manhattan(*p) > 1))
+            .collect();
+        spots.sort();
+        let n = if spec.theme == Theme::Fortress { 3 } else { 2 };
+        for _ in 0..n {
+            if spots.is_empty() {
+                break;
+            }
+            let i = rng.next_u64() as usize % spots.len();
+            let p = spots.swap_remove(i);
+            if chests.iter().all(|q: &Pos| q.manhattan(p) > 2) {
+                g.set(p.x, p.y, Terrain::Chest);
+                chests.push(p);
+            }
+        }
+    }
+
     let reachable = reach_from(&g, starts[0]);
     let rows: Vec<String> = (0..h)
         .map(|y| (0..w).map(|x| terrain_char(g.get(x, y))).collect())
         .collect();
     let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
-    Generated { map: Map::from_rows(&refs), starts, throne, castle, villages, reachable }
+    Generated { map: Map::from_rows(&refs), chests, starts, throne, castle, villages, reachable }
 }
 
 pub fn terrain_char(t: Terrain) -> char {
@@ -390,6 +427,8 @@ pub fn terrain_char(t: Terrain) -> char {
         Terrain::Floor => ',',
         Terrain::Pillar => 'P',
         Terrain::Gate => 'G',
+        Terrain::Door => 'D',
+        Terrain::Chest => 'C',
     }
 }
 
@@ -430,6 +469,9 @@ mod tests {
                     }
                     for v in &g.villages {
                         assert!(g.reachable.contains(v));
+                    }
+                    for c in &g.chests {
+                        assert_eq!(g.map.at(*c), Terrain::Chest);
                     }
                     assert!(g.reachable.len() > (28 * 18) / 3, "{theme:?} {layout:?} {seed}: too little walkable ground ({})", g.reachable.len());
                 }
