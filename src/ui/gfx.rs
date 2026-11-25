@@ -765,10 +765,17 @@ fn paint_unit(l: &UnitLook, up: bool) -> Canvas {
 }
 
 /// Draws a unit sprite in a tile-sized box. `bob` = idle animation frame.
+/// Player units face right, enemies face left.
 pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f32, bob: bool) {
+    draw_unit_facing(look, x, y, size, done, alpha, bob, look.team == Team::Enemy);
+}
+
+/// Like `draw_unit` but with explicit facing (`face_left`).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_unit_facing(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f32, bob: bool, face_left: bool) {
     draw_ellipse(x + size * 0.5, y + size * 0.93, size * 0.3, size * 0.07, 0.0, Color::new(0.0, 0.0, 0.0, 0.28 * alpha));
     let tex = cached(Key::Unit(look, bob, done), || paint_unit(&look, bob).texture(done));
-    blit(&tex, x, y, size, size, look.team == Team::Enemy, alpha);
+    blit(&tex, x, y, size, size, face_left, alpha);
 }
 
 // ------------------------------------------------------------- portraits

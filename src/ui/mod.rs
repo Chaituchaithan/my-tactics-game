@@ -72,7 +72,7 @@ impl App {
     }
 
     fn start_battle(c: &Campaign) -> Screen {
-        Screen::Battle(Box::new(BattleScreen::new(c.battle(seed()), c.chapter)))
+        Screen::Battle(Box::new(BattleScreen::new(c.battle(seed()), c.chapter, c.battle_scenes)))
     }
 
     pub fn frame(&mut self) {

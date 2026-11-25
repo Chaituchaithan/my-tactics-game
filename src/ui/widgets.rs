@@ -232,6 +232,17 @@ pub fn text(s: &str, x: f32, y: f32, size: f32, c: Color) {
     draw_text(s, x, y, size, c);
 }
 
+/// Text with a thick dark outline, readable on any background.
+pub fn text_outlined(s: &str, cx: f32, y: f32, size: f32, c: Color) {
+    let x = cx - text_w(s, size) / 2.0;
+    let o = (size / 14.0).max(2.0);
+    let ink = Color::new(0.06, 0.04, 0.08, c.a);
+    for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (-o, -o), (o, o), (-o, o), (o, -o)] {
+        draw_text(s, x + dx, y + dy, size, ink);
+    }
+    draw_text(s, x, y, size, c);
+}
+
 pub fn text_w(s: &str, size: f32) -> f32 {
     measure_text(s, None, size as u16, 1.0).width
 }

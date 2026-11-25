@@ -28,6 +28,10 @@ Map sizes: Small 16×12, Medium 22×15, Large 28×18, Extra Large 34×22. Enemy 
 
 **Camera:** drag the map to pan. Use **-/+** to switch between the whole map, the normal view and a close-up. The camera follows moving enemies, and tapping during the enemy phase fast-forwards it.
 
+**Battle scenes:** fights play as a close-up side view, with lunges, arrows, spells, hit sparks, crit flashes and screen shake, damage numbers, and stat panels. Tap to skip. Turn them off with **Battle Scenes** on the preparations screen.
+
+**Supports:** 10 pairs of allies (Kael & Brenna, Orrin & Ilse, Tamsin & Corvin and others) build bonds when they end turns within 2 tiles of each other. Each new level (C, B, A) unlocks a conversation in **Supports** on the preparations screen. In battle, each level gives +5 Hit, +5 Avoid, +2 Crit and +2 crit-dodge while the partner is within 3 tiles. The bonus is already included in the forecast.
+
 **Art:** every sprite, portrait and tile is pixel art drawn in code: 32×32 units with outlines and 3-tone shading, varied hair and skin per character, 48×48 face portraits, and detailed terrain. Sprites are cached as textures.
 
 Between chapters you get a **story scene** and a **preparations screen**: army and inventories (equip, discard, give items, use Master Seals, reorder who deploys) and an **armory** that sells weapons, staves and consumables. Progress **auto-saves** before each battle. Choose **Continue** on the title screen to resume.
@@ -78,7 +82,7 @@ src/ui/           macroquad rendering and input
 
 ```sh
 cargo run --release   # play
-cargo test            # 73 tests: combat, pathfinding, AI, items, maps, campaign
+cargo test            # 80 tests: combat, pathfinding, AI, items, maps, supports, campaign
 cargo test --release -- --ignored --nocapture   # auto-battle all 16 chapters
 ```
 

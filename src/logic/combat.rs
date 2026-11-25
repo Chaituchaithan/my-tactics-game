@@ -15,16 +15,32 @@ pub const TRIANGLE_DMG: i32 = 1;
 pub const DOUBLE_THRESHOLD: i32 = 4;
 pub const CRIT_MULT: i32 = 3;
 
+/// Situational modifiers (from nearby support partners).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bonus {
+    pub hit: i32,
+    pub avoid: i32,
+    pub crit: i32,
+    /// Reduces the foe's crit chance.
+    pub dodge: i32,
+}
+
 /// One side of a fight: the unit, the weapon it fights with (if any) and its tile.
 pub struct Combatant<'a> {
     pub unit: &'a Unit,
     pub weapon: Option<Weapon>,
     pub terrain: Terrain,
+    pub bonus: Bonus,
 }
 
 impl<'a> Combatant<'a> {
     pub fn new(unit: &'a Unit, terrain: Terrain) -> Self {
-        Combatant { unit, weapon: unit.weapon(), terrain }
+        Combatant { unit, weapon: unit.weapon(), terrain, bonus: Bonus::default() }
+    }
+
+    pub fn with_bonus(mut self, bonus: Bonus) -> Self {
+        self.bonus = bonus;
+        self
     }
 }
 
@@ -77,14 +93,14 @@ pub fn avoid(u: &Unit, terrain: Terrain) -> i32 {
 
 pub fn hit_chance(a: &Combatant, d: &Combatant) -> i32 {
     match &a.weapon {
-        Some(w) => (accuracy(a.unit, w, d.weapon.as_ref()) - avoid(d.unit, d.terrain)).clamp(0, 100),
+        Some(w) => (accuracy(a.unit, w, d.weapon.as_ref()) + a.bonus.hit - avoid(d.unit, d.terrain) - d.bonus.avoid).clamp(0, 100),
         None => 0,
     }
 }
 
 pub fn crit_chance(a: &Combatant, d: &Combatant) -> i32 {
     match &a.weapon {
-        Some(w) => (w.crit + a.unit.stats.skl / 2 - d.unit.stats.lck).clamp(0, 100),
+        Some(w) => (w.crit + a.unit.stats.skl / 2 + a.bonus.crit - d.unit.stats.lck - d.bonus.dodge).clamp(0, 100),
         None => 0,
     }
 }
@@ -275,6 +291,19 @@ mod tests {
         let fast = dummy(Class::Soldier, Team::Enemy, stats(5, 0, 30, 30, 0, 0), ItemId::IronLance);
         let weak = dummy(Class::Brigand, Team::Player, stats(5, 0, 0, 0, 0, 0), ItemId::IronAxe);
         assert_eq!(hit_chance(&c(&weak, Terrain::Plains), &c(&fast, Terrain::Mountain)), 0);
+    }
+
+    #[test]
+    fn support_bonus_shifts_hit_and_crit() {
+        let a = dummy(Class::Mercenary, Team::Player, stats(5, 5, 5, 4, 3, 0), ItemId::IronSword);
+        let d = dummy(Class::Mercenary, Team::Enemy, stats(5, 5, 5, 4, 3, 0), ItemId::KeenSword);
+        let base = hit_chance(&c(&a, Terrain::Plains), &c(&d, Terrain::Forest));
+        let bonus = Bonus { hit: 10, avoid: 5, crit: 4, dodge: 6 };
+        let ca = c(&a, Terrain::Plains).with_bonus(bonus);
+        assert_eq!(hit_chance(&ca, &c(&d, Terrain::Forest)), base + 10);
+        let cd = c(&d, Terrain::Forest);
+        assert_eq!(hit_chance(&cd, &c(&a, Terrain::Plains).with_bonus(bonus)), hit_chance(&cd, &c(&a, Terrain::Plains)) - 5);
+        assert_eq!(crit_chance(&cd, &c(&a, Terrain::Plains).with_bonus(bonus)), 25 + 2 - 4 - 6);
     }
 
     #[test]

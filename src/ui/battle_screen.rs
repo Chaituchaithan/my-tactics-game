@@ -17,7 +17,8 @@ use crate::logic::campaign::{chapter, Line};
 use crate::logic::combat::{self, Forecast, Side, SideForecast};
 use crate::logic::items::ItemKind;
 use crate::logic::pathfinding::Reach;
-use crate::logic::terrain::MoveType;
+use crate::logic::terrain::{MoveType, Terrain};
+use crate::logic::unit::WeaponKind;
 use crate::logic::unit::{LevelUp, Promotion, Team, STAT_NAMES};
 use crate::logic::Pos;
 
@@ -36,7 +37,7 @@ enum Fx {
     Notice { text: String, color: Color },
     Pause(f32),
     Move { unit: usize, path: Vec<Pos> },
-    CombatBegin { a: usize, d: usize },
+    CombatBegin { a: usize, d: usize, f: Box<Forecast> },
     Strike { by: usize, target: usize, hit: bool, crit: bool, damage: i32, hp_after: i32 },
     CombatEnd,
     Heal { target: usize, amount: i32, hp_after: i32 },
@@ -122,7 +123,23 @@ pub struct BattleScreen {
     fast: bool,
     /// Last layout, for camera decisions made outside drawing.
     lay: Option<Layout>,
+    /// Show close-up battle scenes for fights.
+    scenes: bool,
+    scene: Option<Scene>,
+    scene_skip: bool,
+    impact_done: bool,
 }
+
+/// The fight currently shown as a close-up scene.
+struct Scene {
+    a: usize,
+    d: usize,
+    f: Forecast,
+    terrain: crate::logic::terrain::Terrain,
+}
+
+const SCENE_STRIKE: f32 = 1.15;
+const SCENE_IMPACT: f32 = 0.5;
 
 fn pv(p: Pos) -> Vec2 {
     vec2(p.x as f32, p.y as f32)
@@ -136,7 +153,7 @@ fn team_ink(team: Team) -> Color {
 }
 
 impl BattleScreen {
-    pub fn new(mut b: Battle, chapter_index: usize) -> BattleScreen {
+    pub fn new(mut b: Battle, chapter_index: usize, scenes: bool) -> BattleScreen {
         b.begin_phase(Phase::Player);
         let def = chapter(chapter_index);
         let mut s = BattleScreen {
@@ -164,6 +181,10 @@ impl BattleScreen {
             zoom: 1,
             fast: false,
             lay: None,
+            scenes,
+            scene: None,
+            scene_skip: false,
+            impact_done: false,
         };
         if let Some(lord) = s.b.units.iter().find(|u| u.is_lord) {
             let l = Layout::compute(s.b.map.width, s.b.map.height, s.zoom, Vec2::ZERO);
@@ -237,7 +258,6 @@ impl BattleScreen {
         }
 
         self.draw_map(&lay);
-        self.zoom_buttons(&lay, &mut input);
         let mut exit = self.panel(&lay, &mut input);
         if self.b.phase == Phase::Enemy && input.take().is_some() {
             self.fast = true;
@@ -285,13 +305,14 @@ impl BattleScreen {
         }
     }
 
-    fn zoom_buttons(&mut self, lay: &Layout, input: &mut Input) {
+    /// Zoom controls in the side panel, right-aligned at (`right`, `y`).
+    fn zoom_buttons(&mut self, lay: &Layout, input: &mut Input, right: f32, y: f32) {
         let u = lay.u;
-        let s = (u * 1.9).floor();
-        let x = lay.ox + u * 0.4;
-        let y = lay.oy + lay.map_h - s - u * 0.4;
-        let minus = Rect::new(x, y, s, s);
-        let plus = Rect::new(x + s + u * 0.3, y, s, s);
+        let s = (u * 1.6).floor();
+        let plus = Rect::new(right - s, y, s * 1.0, s);
+        let minus = Rect::new(right - s * 2.0 - u * 0.3, y, s, s);
+        let names = ["Whole map", "Normal", "Close"];
+        text_right(names[self.zoom.min(2)], minus.x - u * 0.4, y + s * 0.68, u * 0.7, DIM);
         let zs = if self.zoom > 0 { ButtonStyle::Normal } else { ButtonStyle::Disabled };
         let zp = if self.zoom + 1 < ZOOM_LEVELS { ButtonStyle::Normal } else { ButtonStyle::Disabled };
         let centre = self.cam + lay.view_tiles() / 2.0;
@@ -313,6 +334,21 @@ impl BattleScreen {
 
     // ------------------------------------------------------------------ flow
 
+    /// Duration of the front effect; battle scenes play combat more slowly.
+    fn fx_duration(&self) -> Option<f32> {
+        let fx = self.fx.front()?;
+        if self.scene.is_some() {
+            let k = if self.scene_skip { 0.15 } else { 1.0 };
+            match fx {
+                Fx::CombatBegin { .. } => return Some(0.6 * k),
+                Fx::Strike { .. } => return Some(SCENE_STRIKE * k),
+                Fx::CombatEnd => return Some(0.7 * k),
+                _ => {}
+            }
+        }
+        fx.duration()
+    }
+
     fn update_fx(&mut self, dt: f32, input: &mut Input) {
         if self.fx.is_empty() {
             return;
@@ -320,10 +356,21 @@ impl BattleScreen {
         if !self.fx_started {
             self.fx_started = true;
             self.fx_t = 0.0;
+            self.impact_done = false;
             self.fx_start();
         }
+        if self.scene.is_some() && input.take().is_some() {
+            self.scene_skip = true;
+        }
         self.fx_t += dt;
-        let done = match self.fx.front().and_then(|f| f.duration()) {
+        let impact = if self.scene_skip { SCENE_IMPACT * 0.15 } else { SCENE_IMPACT };
+        if let Some(Fx::Strike { target, hp_after, .. }) = self.fx.front() {
+            if self.scene.is_some() && !self.impact_done && self.fx_t >= impact {
+                self.vis_hp[*target] = *hp_after;
+                self.impact_done = true;
+            }
+        }
+        let done = match self.fx_duration() {
             Some(d) => self.fx_t >= d,
             None => self.fx_t > 0.3 && input.take().is_some(),
         };
@@ -337,6 +384,9 @@ impl BattleScreen {
     fn fx_start(&mut self) {
         let Some(fx) = self.fx.front() else { return };
         match *fx {
+            Fx::Strike { target, hp_after, .. } if self.scene.is_some() => {
+                let _ = (target, hp_after);
+            }
             Fx::Strike { target, hit, crit, damage, hp_after, .. } => {
                 let (text, color) = if !hit {
                     ("MISS".to_string(), DIM)
@@ -354,7 +404,13 @@ impl BattleScreen {
                 self.floats.push(Float { text: format!("+{}", amount), pos: self.vis_pos[target], t: 0.0, color: GOOD });
                 self.vis_hp[target] = hp_after;
             }
-            Fx::CombatBegin { a, d } => self.combat_pair = Some((a, d)),
+            Fx::CombatBegin { a, d, ref f } => {
+                self.combat_pair = Some((a, d));
+                if self.scenes {
+                    let terrain = self.b.map.at(self.b.units[d].pos);
+                    self.scene = Some(Scene { a, d, f: (**f).clone(), terrain });
+                }
+            }
             _ => {}
         }
     }
@@ -371,7 +427,12 @@ impl BattleScreen {
                 self.vis_alpha[unit] = 1.0;
                 self.vis_hp[unit] = self.b.units[unit].hp;
             }
-            Fx::CombatEnd => self.combat_pair = None,
+            Fx::CombatEnd => {
+                self.combat_pair = None;
+                self.scene = None;
+                self.scene_skip = false;
+            }
+            Fx::Strike { target, hp_after, .. } => self.vis_hp[target] = hp_after,
             Fx::Recruit { unit } => self.vis_team[unit] = Team::Player,
             Fx::Promote { unit, .. } => self.vis_hp[unit] = self.b.units[unit].hp,
             _ => {}
@@ -480,7 +541,7 @@ impl BattleScreen {
     }
 
     fn push_combat(&mut self, r: &CombatReport) {
-        self.fx.push_back(Fx::CombatBegin { a: r.attacker, d: r.defender });
+        self.fx.push_back(Fx::CombatBegin { a: r.attacker, d: r.defender, f: Box::new(r.forecast.clone()) });
         for s in &r.outcome.strikes {
             let (by, target) = match s.by {
                 Side::Attacker => (r.attacker, r.defender),
@@ -646,6 +707,11 @@ impl BattleScreen {
         let gold = if self.b.gold > 0 { format!("   +{}G", self.b.gold) } else { String::new() };
         text(&format!("{} must survive{}", lord, gold), inner.x, y, u * 0.75, DIM);
         y += u * 0.6;
+        draw_line(inner.x, y, inner.x + inner.w, y, 2.0, rgb(80, 70, 110));
+        y += u * 0.4;
+        text("Zoom", inner.x, y + u * 1.1, u * 0.75, DIM);
+        self.zoom_buttons(lay, input, inner.x + inner.w, y);
+        y += u * 2.0;
         draw_line(inner.x, y, inner.x + inner.w, y, 2.0, rgb(80, 70, 110));
         y += u * 1.2;
 
@@ -881,6 +947,21 @@ impl BattleScreen {
         text(&role, x, y, u * 0.85, DIM);
         if un.team == Team::Player {
             text_right(&format!("EXP {}", un.xp), x + w, y, u * 0.85, DIM);
+        }
+        let bonds: Vec<String> = self
+            .b
+            .supports
+            .iter()
+            .filter(|st| st.level > 0 && st.involves(&un.name))
+            .map(|st| {
+                let p = st.partner(&un.name).unwrap_or("");
+                let near = self.b.active_partners(id, un.pos).iter().any(|(n, _)| n == p);
+                format!("{} {}{}", p, crate::logic::supports::level_name(st.level), if near { "*" } else { "" })
+            })
+            .collect();
+        if !bonds.is_empty() {
+            y += u * 0.85;
+            text(&format!("Support: {}", bonds.join(", ")), x, y, u * 0.65, GOOD);
         }
         y += u * 0.6;
         hp_bar(x, y, w * 0.6, u * 0.55, hp, un.stats.hp);
@@ -1187,6 +1268,10 @@ impl BattleScreen {
         let u = lay.u;
         let map = Rect::new(lay.ox, lay.oy, lay.map_w, lay.map_h);
 
+        if self.scene.is_some() {
+            self.draw_scene();
+            return;
+        }
         if let Some((a, d)) = self.combat_pair {
             let w = map.w * 0.8;
             let h = u * 3.4;
@@ -1261,6 +1346,194 @@ impl BattleScreen {
             }
             _ => {}
         }
+    }
+
+    /// Close-up side view of the current fight. Player units stand on the right.
+    fn draw_scene(&self) {
+        let Some(sc) = &self.scene else { return };
+        let (w, h) = (screen_width(), screen_height());
+        let u = ui_unit();
+        let t = self.time;
+        let indoor = matches!(sc.terrain, Terrain::Floor | Terrain::Pillar | Terrain::Throne | Terrain::Gate | Terrain::Wall);
+
+        // Current strike, if any, and its progress (0..1 over the strike).
+        let strike = match self.fx.front() {
+            Some(Fx::Strike { by, target, hit, crit, damage, hp_after, .. }) if self.fx_started => Some((*by, *target, *hit, *crit, *damage, *hp_after)),
+            _ => None,
+        };
+        let dur = self.fx_duration().unwrap_or(SCENE_STRIKE).max(0.01);
+        let k = (self.fx_t / dur).clamp(0.0, 1.0);
+        let impact = SCENE_IMPACT / SCENE_STRIKE;
+        let crit_flash = matches!(strike, Some((.., true, _, _))) && strike.is_some_and(|s| s.2) && k > impact && k < impact + 0.18;
+        let shake = if crit_flash { ((t * 70.0).sin() * u * 0.4, (t * 53.0).cos() * u * 0.3) } else { (0.0, 0.0) };
+
+        // Backdrop
+        if indoor {
+            for i in 0..12 {
+                let c = 0.10 + i as f32 * 0.012;
+                draw_rectangle(0.0, h * i as f32 / 12.0 * 0.62, w, h * 0.62 / 12.0 + 1.0, Color::new(c, c * 0.95, c * 1.2, 1.0));
+            }
+            for x in 0..8 {
+                let px = w * (x as f32 + 0.5) / 8.0;
+                draw_rectangle(px - u * 0.8, h * 0.05, u * 1.6, h * 0.57, rgb(70, 70, 86));
+                draw_rectangle(px - u * 0.8, h * 0.05, u * 0.4, h * 0.57, rgb(96, 96, 112));
+            }
+        } else {
+            for i in 0..12 {
+                let f = i as f32 / 12.0;
+                draw_rectangle(0.0, h * f * 0.62, w, h * 0.62 / 12.0 + 1.0, Color::new(0.38 + f * 0.25, 0.58 + f * 0.2, 0.92, 1.0));
+            }
+            for (cx, cy, r) in [(0.2, 0.15, 0.06), (0.27, 0.13, 0.045), (0.7, 0.2, 0.05), (0.78, 0.18, 0.07)] {
+                draw_circle(w * cx + (t * 6.0) % w * 0.02, h * cy, h * r, Color::new(1.0, 1.0, 1.0, 0.8));
+            }
+            // distant hills
+            for x in 0..10 {
+                let px = w * x as f32 / 9.0;
+                draw_circle(px, h * 0.64, h * 0.12, rgb(84, 140, 90));
+            }
+        }
+        let gt = (h * 0.13).floor();
+        let gy = (h * 0.6).floor();
+        let cols = (w / gt).ceil() as i32 + 1;
+        for row in 0..4 {
+            for c in 0..cols {
+                gfx::draw_terrain(sc.terrain, c as f32 * gt, gy + row as f32 * gt, gt, c, row, t, false);
+            }
+        }
+        draw_rectangle(0.0, gy, w, h * 0.02, Color::new(0.0, 0.0, 0.0, 0.18));
+
+        // Fighters: player side on the right.
+        let (left_id, right_id) = if self.b.units[sc.a].team == Team::Player { (sc.d, sc.a) } else { (sc.a, sc.d) };
+        let size = (h * 0.36).floor();
+        let base_y = gy - size * 0.92;
+        let home = |id: usize| if id == right_id { w * 0.66 } else { w * 0.34 - size };
+        let mut xs = [(left_id, home(left_id)), (right_id, home(right_id))];
+        let mut alphas = [1.0f32, 1.0];
+        let mut projectile: Option<(f32, f32, WeaponKind)> = None;
+        if let Some((by, target, hit, _crit, _dmg, hp_after)) = strike {
+            let dir = if by == right_id { -1.0 } else { 1.0 };
+            let kind = self.b.units[by].weapon().map(|w| w.kind).unwrap_or(WeaponKind::Sword);
+            let ranged = matches!(kind, WeaponKind::Bow | WeaponKind::Magic);
+            let gap = (home(right_id) - home(left_id)) - size * 0.55;
+            for (id, x) in xs.iter_mut() {
+                if *id == by && !ranged {
+                    let lunge = if k < impact {
+                        (k / impact).powf(2.0)
+                    } else if k < impact + 0.12 {
+                        1.0
+                    } else {
+                        (1.0 - (k - impact - 0.12) / (1.0 - impact - 0.12)).max(0.0)
+                    };
+                    *x += dir * gap * lunge;
+                }
+                if *id == by && ranged && k < impact {
+                    *x -= dir * u * 0.5 * (k / impact * PI).sin();
+                }
+                if *id == target && k > impact {
+                    let after = (k - impact) / (1.0 - impact);
+                    if hit {
+                        *x += dir * (after * 30.0).sin() * u * 0.35 * (1.0 - after);
+                    } else {
+                        *x += dir * u * 2.5 * (after * PI).sin();
+                    }
+                }
+            }
+            if ranged && k > impact * 0.35 && k < impact {
+                let p = (k - impact * 0.35) / (impact * 0.65);
+                let from = home(by) + size * 0.5;
+                let to = home(target) + size * 0.5;
+                projectile = Some((from + (to - from) * p, base_y + size * 0.45, kind));
+            }
+            if hp_after == 0 && k > impact {
+                let i = if target == left_id { 0 } else { 1 };
+                alphas[i] = (1.0 - (k - impact) / (1.0 - impact) * 1.2).max(0.0);
+            }
+        }
+        for (slot, (id, x)) in xs.iter().enumerate() {
+            let un = &self.b.units[*id];
+            let mut lk = UnitLook::of(un);
+            lk.team = self.vis_team[*id];
+            let bob = ((t * 2.5) as i32 + slot as i32) % 2 == 0;
+            gfx::draw_unit_facing(lk, x + shake.0, base_y + shake.1, size, false, alphas[slot], bob, *id == right_id);
+        }
+
+        // Projectiles and impact effects
+        if let Some((px, py, kind)) = projectile {
+            match kind {
+                WeaponKind::Bow => {
+                    let dir = if px > w / 2.0 { 1.0 } else { -1.0 };
+                    draw_line(px - dir * u * 2.0, py, px, py, 3.0, rgb(120, 80, 40));
+                    draw_triangle(vec2(px + dir * u * 0.6, py), vec2(px, py - u * 0.3), vec2(px, py + u * 0.3), rgb(220, 224, 236));
+                }
+                _ => {
+                    let r = u * (0.6 + 0.4 * (t * 20.0).sin().abs());
+                    draw_circle(px, py, r * 1.6, Color::new(1.0, 0.5, 0.1, 0.35));
+                    draw_circle(px, py, r, rgb(255, 210, 120));
+                }
+            }
+        }
+        if let Some((by, target, hit, crit, dmg, _)) = strike {
+            let tx = xs.iter().find(|(id, _)| *id == target).map(|(_, x)| *x).unwrap_or(0.0) + size * 0.5;
+            let ty = base_y + size * 0.45;
+            if k > impact && k < impact + 0.2 && hit {
+                let a = 1.0 - (k - impact) / 0.2;
+                let kind = self.b.units[by].weapon().map(|w| w.kind).unwrap_or(WeaponKind::Sword);
+                if kind == WeaponKind::Magic {
+                    draw_circle(tx, ty, size * 0.45 * (1.0 - a * 0.5), Color::new(1.0, 0.6, 0.2, 0.6 * a));
+                } else {
+                    for i in 0..5 {
+                        let ang = i as f32 * 1.256 + t * 3.0;
+                        let r0 = size * 0.1;
+                        let r1 = size * (0.25 + 0.2 * (1.0 - a));
+                        draw_line(tx + ang.cos() * r0, ty + ang.sin() * r0, tx + ang.cos() * r1, ty + ang.sin() * r1, 4.0, Color::new(1.0, 1.0, 0.85, a));
+                    }
+                }
+            }
+            if k > impact {
+                let rise = (k - impact) / (1.0 - impact);
+                let (label, c) = if !hit {
+                    ("MISS".to_string(), DIM)
+                } else if dmg == 0 {
+                    ("NO DAMAGE".to_string(), DIM)
+                } else {
+                    (format!("{}", dmg), if crit { ACCENT } else { INK })
+                };
+                let size_t = if crit && hit { u * 2.6 } else { u * 1.8 };
+                text_outlined(&label, tx, base_y - u * 0.5 - rise * u * 2.0, size_t, Color::new(c.r, c.g, c.b, 1.0 - rise * 0.6));
+            }
+            if crit && hit && k < impact {
+                text_outlined("CRITICAL!", w / 2.0, h * 0.18, u * 2.4, Color::new(1.0, 0.85, 0.3, 0.6 + 0.4 * (t * 20.0).sin().abs()));
+            }
+        }
+        if crit_flash {
+            let a = 1.0 - (k - impact) / 0.18;
+            draw_rectangle(0.0, 0.0, w, h, Color::new(1.0, 1.0, 1.0, 0.65 * a));
+        }
+
+        // Stat panels along the bottom
+        let ph = h * 0.22;
+        let py = h - ph;
+        for (slot, id) in [left_id, right_id].into_iter().enumerate() {
+            let un = &self.b.units[id];
+            let side = if id == sc.a { &sc.f.attacker } else { &sc.f.defender };
+            let r = Rect::new(slot as f32 * w / 2.0, py, w / 2.0, ph);
+            draw_rectangle(r.x, r.y, r.w, r.h, if self.vis_team[id] == Team::Player { rgb(30, 46, 100) } else { rgb(100, 30, 34) });
+            draw_rectangle_lines(r.x + 3.0, r.y + 3.0, r.w - 6.0, r.h - 6.0, 3.0, rgb(220, 200, 140));
+            let x = r.x + u;
+            text(&un.name, x, r.y + u * 1.6, u * 1.2, INK);
+            let wn = un.weapon().map(|w| w.name).unwrap_or("-");
+            text_right(wn, r.x + r.w - u, r.y + u * 1.6, u * 0.9, ACCENT);
+            let stats = if side.strikes == 0 {
+                "HIT --  DMG --  CRT --".to_string()
+            } else {
+                format!("HIT {}  DMG {}{}  CRT {}", side.hit, side.damage, if side.strikes > 1 { " x2" } else { "" }, side.crit)
+            };
+            text(&stats, x, r.y + u * 3.0, u * 0.85, DIM);
+            let hp = self.vis_hp[id];
+            text(&format!("HP {}", hp), x, r.y + ph - u * 1.0, u * 1.1, INK);
+            hp_bar(x + u * 4.2, r.y + ph - u * 1.7, r.w - u * 5.5, u * 0.8, hp, un.stats.hp);
+        }
+        text_right("Tap to skip", w - u * 0.5, u * 1.2, u * 0.7, Color::new(1.0, 1.0, 1.0, 0.6));
     }
 
     fn over_screen(&mut self, lay: &Layout, input: &mut Input, victory: bool) -> BattleExit {

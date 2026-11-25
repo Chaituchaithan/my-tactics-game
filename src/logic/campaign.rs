@@ -9,6 +9,7 @@ use super::items::ItemId;
 use super::map::Map;
 use super::mapgen::{self, Generated, Layout, MapSpec, Theme};
 use super::rng::Rng;
+use super::supports::{self, SupportState};
 use super::terrain::Terrain;
 use super::unit::{AiMode, Class, Stats, Team, Unit};
 use super::Pos;
@@ -1034,11 +1035,19 @@ pub struct Campaign {
     /// Number of chapters whose joins have been applied.
     pub joined_through: usize,
     pub finished: bool,
+    #[serde(default)]
+    pub supports: Vec<SupportState>,
+    #[serde(default = "yes")]
+    pub battle_scenes: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Campaign {
     pub fn new(permadeath: bool) -> Campaign {
-        Campaign { chapter: 0, army: starting_army(), gold: 0, permadeath, fallen: Vec::new(), joined_through: 0, finished: false }
+        Campaign { chapter: 0, army: starting_army(), gold: 0, permadeath, fallen: Vec::new(), joined_through: 0, finished: false, supports: Vec::new(), battle_scenes: true }
     }
 
     pub fn def(&self) -> ChapterDef {
@@ -1080,14 +1089,47 @@ impl Campaign {
         }
         units.extend(def.enemies);
         let mut b = Battle::new(def.map, units, seed, self.permadeath);
+        b.supports = self.support_list();
         b.objective = def.objective;
         b.reinforcements = def.reinforcements;
         b.villages = def.villages.into_iter().map(|(pos, reward)| Village { pos, reward, visited: false }).collect();
         b
     }
 
+    /// Support bonds between current army members (missing ones start at zero).
+    pub fn support_list(&self) -> Vec<SupportState> {
+        let has = |n: &str| self.army.iter().any(|u| u.name == n);
+        supports::pairs()
+            .into_iter()
+            .filter(|p| has(p.a) && has(p.b))
+            .map(|p| self.supports.iter().find(|s| s.is(p.a, p.b)).cloned().unwrap_or_else(|| SupportState::new(p.a, p.b)))
+            .collect()
+    }
+
+    /// Views the next conversation of support `i` (from `support_list`), raising its level.
+    pub fn view_support(&mut self, a: &str, b: &str) -> Option<Vec<Line>> {
+        let mut st = self.support_list().into_iter().find(|s| s.is(a, b))?;
+        if !st.ready() {
+            return None;
+        }
+        let lines = supports::conversation(a, b, st.level)?;
+        st.level += 1;
+        self.store_support(st);
+        Some(lines)
+    }
+
+    fn store_support(&mut self, st: SupportState) {
+        match self.supports.iter_mut().find(|s| s.is(&st.a, &st.b)) {
+            Some(s) => *s = st,
+            None => self.supports.push(st),
+        }
+    }
+
     /// Copies the battle's results back into the army and advances the chapter.
     pub fn finish_chapter(&mut self, b: &Battle) {
+        for st in &b.supports {
+            self.store_support(st.clone());
+        }
         for u in b.units.iter().filter(|u| u.team == Team::Player) {
             let mut kept = u.clone();
             kept.hp = kept.stats.hp;
@@ -1243,6 +1285,34 @@ mod tests {
         let b = c.battle(1);
         assert!(b.units[0].is_lord);
         assert_eq!(b.units[0].pos, setup(0).starts[0]);
+    }
+
+    #[test]
+    fn supports_persist_and_unlock() {
+        let mut c = Campaign::new(true);
+        c.begin_chapter();
+        let mut b = c.battle(1);
+        assert!(b.supports.iter().any(|s| s.is("Kael", "Brenna")));
+        let i = b.supports.iter().position(|s| s.is("Kael", "Brenna")).unwrap();
+        b.supports[i].points = 3;
+        let boss = b.units.iter().position(|u| u.is_boss).unwrap();
+        b.units[boss].alive = false;
+        c.finish_chapter(&b);
+        assert!(c.support_list().iter().any(|s| s.is("Kael", "Brenna") && s.ready()));
+        let lines = c.view_support("Brenna", "Kael").expect("C conversation");
+        assert!(!lines.is_empty());
+        assert!(c.view_support("Kael", "Brenna").is_none(), "B needs more points");
+        assert_eq!(c.battle(2).support_level("Kael", "Brenna"), 1);
+    }
+
+    #[test]
+    fn old_saves_load_with_defaults() {
+        let mut v: serde_json::Value = serde_json::to_value(Campaign::new(true)).unwrap();
+        v.as_object_mut().unwrap().remove("supports");
+        v.as_object_mut().unwrap().remove("battle_scenes");
+        let c: Campaign = serde_json::from_value(v).unwrap();
+        assert!(c.supports.is_empty());
+        assert!(c.battle_scenes);
     }
 
     #[test]

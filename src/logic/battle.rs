@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
-use super::combat::{self, CombatOutcome, Combatant, Forecast, Side};
+use super::combat::{self, Bonus, CombatOutcome, Combatant, Forecast, Side};
+use super::supports::{self, SupportState};
 use super::items::{ItemId, ItemKind};
 use super::map::Map;
 use super::pathfinding::{reachable, tiles_in_range, Occupant, Reach};
@@ -58,6 +59,7 @@ pub struct XpEvent {
 pub struct CombatReport {
     pub attacker: usize,
     pub defender: usize,
+    pub forecast: Forecast,
     pub outcome: CombatOutcome,
     pub xp: Option<XpEvent>,
     pub deaths: Vec<usize>,
@@ -114,6 +116,8 @@ pub struct Battle {
     /// Gold picked up during this battle.
     pub gold: i32,
     pub seized: bool,
+    /// Support bonds between the deployed allies (points grow during battle).
+    pub supports: Vec<SupportState>,
 }
 
 impl Battle {
@@ -131,6 +135,7 @@ impl Battle {
             villages: Vec::new(),
             gold: 0,
             seized: false,
+            supports: Vec::new(),
         }
     }
 
@@ -221,24 +226,76 @@ impl Battle {
         matches!(self.objective, Objective::Seize(p) if u.is_lord && u.pos == p)
     }
 
+    /// Support level between two named units (0 = none).
+    #[cfg(test)]
+    pub fn support_level(&self, a: &str, b: &str) -> u8 {
+        self.supports.iter().find(|s| s.is(a, b)).map_or(0, |s| s.level)
+    }
+
+    /// Bonus `id` gets from support partners near `at`.
+    pub fn support_bonus(&self, id: usize, at: Pos) -> Bonus {
+        let u = &self.units[id];
+        let mut total = Bonus::default();
+        for s in self.supports.iter().filter(|s| s.level > 0 && s.involves(&u.name)) {
+            let partner = s.partner(&u.name).unwrap_or("");
+            if let Some(p) = self.units.iter().enumerate().find(|(i, p)| *i != id && p.alive && p.team == u.team && p.name == partner) {
+                if p.1.pos.manhattan(at) <= supports::RANGE {
+                    total = supports::add(total, supports::bonus_for(s.level));
+                }
+            }
+        }
+        total
+    }
+
+    /// Names of support partners currently close enough to help `id` at `at`.
+    pub fn active_partners(&self, id: usize, at: Pos) -> Vec<(String, u8)> {
+        let u = &self.units[id];
+        self.supports
+            .iter()
+            .filter(|s| s.level > 0 && s.involves(&u.name))
+            .filter_map(|s| {
+                let partner = s.partner(&u.name)?;
+                self.units
+                    .iter()
+                    .any(|p| p.alive && p.team == u.team && p.name == partner && p.pos.manhattan(at) <= supports::RANGE)
+                    .then(|| (partner.to_string(), s.level))
+            })
+            .collect()
+    }
+
+    fn combatants(&self, a: &Unit, from: Pos, att: usize, def: usize) -> Forecast {
+        let d = &self.units[def];
+        let ca = Combatant::new(a, self.map.at(from)).with_bonus(self.support_bonus(att, from));
+        let cd = Combatant::new(d, self.map.at(d.pos)).with_bonus(self.support_bonus(def, d.pos));
+        combat::forecast(&ca, &cd, from.manhattan(d.pos))
+    }
+
     /// Forecast for `att` attacking `def` while standing on `from`, using equipped weapons.
     pub fn forecast_from(&self, att: usize, from: Pos, def: usize) -> Forecast {
-        let a = &self.units[att];
-        let d = &self.units[def];
-        let ca = Combatant::new(a, self.map.at(from));
-        let cd = Combatant::new(d, self.map.at(d.pos));
-        combat::forecast(&ca, &cd, from.manhattan(d.pos))
+        self.combatants(&self.units[att], from, att, def)
     }
 
     /// Forecast as if the attacker equipped the first weapon that reaches the target.
     pub fn forecast_best(&self, att: usize, from: Pos, def: usize) -> Forecast {
-        let d = &self.units[def];
-        let dist = from.manhattan(d.pos);
+        let dist = from.manhattan(self.units[def].pos);
         let mut a = self.units[att].clone();
         a.equip_for_range(dist);
-        let ca = Combatant::new(&a, self.map.at(from));
-        let cd = Combatant::new(d, self.map.at(d.pos));
-        combat::forecast(&ca, &cd, dist)
+        self.combatants(&a, from, att, def)
+    }
+
+    /// End of the player phase: allies standing close together grow their bonds.
+    fn grow_supports(&mut self) {
+        let pos_of = |name: &str| self.units.iter().find(|u| u.alive && u.team == Team::Player && u.name == name).map(|u| u.pos);
+        let gains: Vec<usize> = self
+            .supports
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!((pos_of(&s.a), pos_of(&s.b)), (Some(a), Some(b)) if a.manhattan(b) <= 2))
+            .map(|(i, _)| i)
+            .collect();
+        for i in gains {
+            self.supports[i].gain(1);
+        }
     }
 
     pub fn forecast(&self, att: usize, def: usize) -> Forecast {
@@ -310,7 +367,7 @@ impl Battle {
             None
         };
 
-        CombatReport { attacker: att, defender: def, outcome, xp, deaths, broken }
+        CombatReport { attacker: att, defender: def, forecast, outcome, xp, deaths, broken }
     }
 
     pub fn heal(&mut self, healer: usize, target: usize) -> HealReport {
@@ -412,6 +469,7 @@ impl Battle {
         self.phase = phase;
         let mut start = PhaseStart::default();
         if phase == Phase::Enemy {
+            self.grow_supports();
             let turn = self.turn;
             let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.reinforcements).into_iter().partition(|(t, _)| *t <= turn);
             self.reinforcements = later;
@@ -688,6 +746,26 @@ mod tests {
         b.recruit(2);
         assert_eq!(b.units[2].team, Team::Player);
         assert!(b.talk_targets_from(0, Pos::new(0, 0)).is_empty());
+    }
+
+    #[test]
+    fn supports_grow_and_help() {
+        let a = Unit::generic("Kael", Class::Lord, Team::Player, 1, &[ItemId::IronSword], Pos::new(0, 0)).lord();
+        let b = Unit::generic("Brenna", Class::Lancer, Team::Player, 1, &[ItemId::IronLance], Pos::new(1, 0));
+        let e = Unit::generic("Foe", Class::Brigand, Team::Enemy, 1, &[ItemId::IronAxe], Pos::new(0, 1));
+        let mut bt = Battle::new(plains(8, 8), vec![a, b, e], 1, true);
+        bt.supports.push(SupportState::new("Kael", "Brenna"));
+        let before = bt.forecast(0, 2).attacker.hit;
+        bt.begin_phase(Phase::Enemy);
+        assert_eq!(bt.supports[0].points, 1, "adjacent at end of player phase");
+        bt.supports[0].level = 2;
+        assert_eq!(bt.support_bonus(0, Pos::new(0, 0)).hit, 10);
+        assert_eq!(bt.active_partners(0, Pos::new(0, 0)), vec![("Brenna".to_string(), 2)]);
+        let after = bt.forecast(0, 2).attacker.hit;
+        assert_eq!(after, (before + 10).min(100));
+        // Partner far away: no bonus.
+        bt.units[1].pos = Pos::new(7, 7);
+        assert_eq!(bt.support_bonus(0, Pos::new(0, 0)), Bonus::default());
     }
 
     #[test]

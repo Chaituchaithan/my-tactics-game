@@ -4,7 +4,9 @@ use macroquad::prelude::*;
 
 use super::gfx::{self, rgb, UnitLook};
 use super::widgets::*;
-use crate::logic::campaign::Campaign;
+use super::battle_screen::dialogue_box;
+use crate::logic::campaign::{Campaign, Line};
+use crate::logic::supports::{self, THRESHOLDS};
 use crate::logic::items::{ItemKind, MAX_ITEMS, SHOP};
 use crate::logic::unit::{Unit, STAT_NAMES};
 
@@ -19,6 +21,7 @@ enum Tab {
     Main,
     Army,
     Shop,
+    Supports,
 }
 
 pub struct PrepScreen {
@@ -30,11 +33,13 @@ pub struct PrepScreen {
     time: f32,
     /// (chapter, deploy slots, objective, map size) computed once per chapter.
     info: Option<(usize, usize, String, String)>,
+    /// Support conversation being shown: (lines, index, time on line).
+    convo: Option<(Vec<Line>, usize, f32)>,
 }
 
 impl PrepScreen {
     pub fn new() -> PrepScreen {
-        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0, info: None }
+        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0, info: None, convo: None }
     }
 
     fn say(&mut self, s: impl Into<String>) {
@@ -64,6 +69,26 @@ impl PrepScreen {
         }
         let (_, slots, objective, size) = self.info.clone().unwrap();
 
+        if let Some((lines, idx, t)) = &mut self.convo {
+            *t += dt;
+            let line = lines[*idx];
+            let look = c.army.iter().find(|u| u.name == line.speaker).map(UnitLook::of);
+            draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.5));
+            dialogue_box(Rect::new(0.0, 0.0, w, h), u, line.speaker, line.text, look, *t);
+            if input.take().is_some() {
+                if *t < line.text.len() as f32 / 90.0 {
+                    *t = 100.0;
+                } else {
+                    *idx += 1;
+                    *t = 0.0;
+                    if *idx >= lines.len() {
+                        self.convo = None;
+                    }
+                }
+            }
+            return PrepExit::Stay;
+        }
+
         let m = u * 0.6;
         let left = Rect::new(m, m, (w * 0.42).max(u * 12.0).min(w - u * 14.0), h - m * 2.0);
         let right = Rect::new(left.x + left.w + m, m, w - left.w - m * 3.0, h - m * 2.0);
@@ -75,6 +100,10 @@ impl PrepScreen {
             }
             Tab::Shop => {
                 self.shop(c, &mut input, left, right, u);
+                PrepExit::Stay
+            }
+            Tab::Supports => {
+                self.supports(c, &mut input, left, right, u);
                 PrepExit::Stay
             }
         };
@@ -130,6 +159,15 @@ impl PrepScreen {
         let mut exit = PrepExit::Stay;
         if button(input, col.next(), "Save & Quit", ButtonStyle::Normal, u) {
             exit = PrepExit::Title;
+        }
+        let scenes = if c.battle_scenes { "Battle Scenes: On" } else { "Battle Scenes: Off" };
+        if button(input, col.next(), scenes, ButtonStyle::Normal, u) {
+            c.battle_scenes = !c.battle_scenes;
+        }
+        let ready = c.support_list().iter().filter(|s| s.ready()).count();
+        let label = if ready > 0 { format!("Supports ({} new!)", ready) } else { "Supports".to_string() };
+        if button(input, col.next(), &label, if ready > 0 { ButtonStyle::Primary } else { ButtonStyle::Normal }, u) {
+            self.tab = Tab::Supports;
         }
         if button(input, col.next(), "Shop", ButtonStyle::Normal, u) {
             self.tab = Tab::Shop;
@@ -258,6 +296,74 @@ impl PrepScreen {
                 }
                 ItemKind::Heal(_) => {}
             }
+        }
+    }
+
+    fn supports(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32) {
+        text("Supports", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
+        let list = c.support_list();
+        let rh = u * 2.0;
+        let mut y = left.y + u * 2.4;
+        let mut view = None;
+        for st in &list {
+            if y + rh > left.y + left.h {
+                break;
+            }
+            let r = Rect::new(left.x, y, left.w, rh);
+            draw_rectangle(r.x, r.y, r.w, r.h, rgb(36, 40, 70));
+            draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, rgb(80, 70, 110));
+            text(&format!("{} & {}", st.a, st.b), r.x + u * 0.5, r.y + u * 1.35, u * 0.85, ALLY);
+            text(supports::level_name(st.level), r.x + r.w * 0.5, r.y + u * 1.35, u, ACCENT);
+            // progress pips
+            for k in 0..3u8 {
+                let filled = st.level > k;
+                let px = r.x + r.w * 0.56 + k as f32 * u * 0.9;
+                let c = if filled { ACCENT } else { rgb(70, 70, 90) };
+                draw_rectangle(px, r.y + u * 0.7, u * 0.6, u * 0.6, c);
+            }
+            let br = Rect::new(r.x + r.w - u * 5.5, r.y + u * 0.2, u * 5.2, rh - u * 0.4);
+            if st.ready() {
+                if button(input, br, "Talk!", ButtonStyle::Primary, u * 0.8) {
+                    view = Some((st.a.clone(), st.b.clone()));
+                }
+            } else if st.level < supports::MAX_LEVEL {
+                let need = THRESHOLDS[st.level as usize];
+                text_right(&format!("{}/{}", st.points, need), br.x + br.w, r.y + u * 1.35, u * 0.8, DIM);
+            } else {
+                text_right("Max", br.x + br.w, r.y + u * 1.35, u * 0.8, GOOD);
+            }
+            y += rh + u * 0.25;
+        }
+        if list.is_empty() {
+            text("No bonds yet.", left.x, y + u, u * 0.85, DIM);
+        }
+        if let Some((a, b)) = view {
+            if let Some(lines) = c.view_support(&a, &b) {
+                self.convo = Some((lines, 0, 0.0));
+            }
+        }
+
+        frame(right);
+        let x = right.x + u;
+        let mut ty = right.y + u * 1.8;
+        for line in [
+            "Allies who end their turn within",
+            "2 tiles of each other grow closer.",
+            "",
+            "Each support level (C, B, A) gives",
+            "+5 Hit, +5 Avoid, +2 Crit and +2",
+            "crit-dodge per level while the",
+            "partner is within 3 tiles.",
+            "",
+            "View a conversation to raise",
+            "the level.",
+        ] {
+            text(line, x, ty, u * 0.8, if line.is_empty() { DIM } else { INK });
+            ty += u * 1.0;
+        }
+        let mut col = ButtonColumn::new(Rect::new(x, right.y, right.w - u * 2.0, right.h - u * 0.8), u);
+        if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
+            self.tab = Tab::Main;
         }
     }
 

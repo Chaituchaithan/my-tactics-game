@@ -10,6 +10,7 @@ pub mod map;
 pub mod mapgen;
 pub mod pathfinding;
 pub mod rng;
+pub mod supports;
 pub mod terrain;
 pub mod unit;
 
