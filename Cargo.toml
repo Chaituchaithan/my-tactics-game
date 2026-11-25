@@ -1,0 +1,31 @@
+[package]
+name = "emberfall"
+version = "0.1.0"
+edition = "2021"
+description = "Emberfall Tactics - a retro tactical strategy RPG"
+
+[dependencies]
+macroquad = { version = "0.4", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# ---- Android packaging (cargo-quad-apk, the miniquad/macroquad fork of cargo-apk) ----
+[package.metadata.android]
+package_name = "com.emberfall.tactics"
+label = "Emberfall Tactics"
+version_code = 1
+version_name = "0.1.0"
+fullscreen = true
+build_targets = ["armv7-linux-androideabi", "aarch64-linux-android"]
+min_sdk_version = 21
+
+[package.metadata.android.activity_attributes]
+"android:exported" = "true"
+"android:screenOrientation" = "userLandscape"
