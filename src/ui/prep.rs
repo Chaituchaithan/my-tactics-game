@@ -28,11 +28,13 @@ pub struct PrepScreen {
     shop_item: usize,
     msg: Option<(String, f32)>,
     time: f32,
+    /// (chapter, deploy slots, objective, map size) computed once per chapter.
+    info: Option<(usize, usize, String, String)>,
 }
 
 impl PrepScreen {
     pub fn new() -> PrepScreen {
-        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0 }
+        PrepScreen { tab: Tab::Main, unit: 0, item: None, shop_item: 0, msg: None, time: 0.0, info: None }
     }
 
     fn say(&mut self, s: impl Into<String>) {
@@ -53,14 +55,22 @@ impl PrepScreen {
         let mut input = Input::poll();
         draw_rectangle(0.0, 0.0, w, h, rgb(20, 22, 40));
         self.unit = self.unit.min(c.army.len().saturating_sub(1));
+        if self.info.as_ref().is_none_or(|i| i.0 != c.chapter) {
+            let b = c.battle(0);
+            let def = c.def();
+            let size = format!("{} map {}x{}, {} foes", def.tier.name(), b.map.width, b.map.height, b.living(crate::logic::unit::Team::Enemy).count() + b.reinforcements.len());
+            let slots = b.living(crate::logic::unit::Team::Player).count().max(crate::logic::campaign::setup(c.chapter).starts.len());
+            self.info = Some((c.chapter, slots, b.objective_text(), size));
+        }
+        let (_, slots, objective, size) = self.info.clone().unwrap();
 
         let m = u * 0.6;
         let left = Rect::new(m, m, (w * 0.42).max(u * 12.0).min(w - u * 14.0), h - m * 2.0);
         let right = Rect::new(left.x + left.w + m, m, w - left.w - m * 3.0, h - m * 2.0);
         let exit = match self.tab {
-            Tab::Main => self.main(c, &mut input, left, right, u),
+            Tab::Main => self.main(c, &mut input, left, right, u, slots, &objective, &size),
             Tab::Army => {
-                self.army(c, &mut input, left, right, u);
+                self.army(c, &mut input, left, right, u, slots);
                 PrepExit::Stay
             }
             Tab::Shop => {
@@ -78,7 +88,8 @@ impl PrepScreen {
         exit
     }
 
-    fn main(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32) -> PrepExit {
+    #[allow(clippy::too_many_arguments)]
+    fn main(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize, objective: &str, size: &str) -> PrepExit {
         let def = c.def();
         frame(left);
         let mut y = left.y + u * 1.8;
@@ -88,17 +99,18 @@ impl PrepScreen {
             text(&line, left.x + u, y, u * 1.5, ACCENT);
             y += u * 1.7;
         }
-        let b = c.battle(0);
-        text(&format!("Goal: {}", b.objective_text()), left.x + u, y, u * 0.85, INK);
+        text(&format!("Goal: {}", objective), left.x + u, y, u * 0.85, INK);
         y += u * 1.1;
-        text(&format!("Deploy {} of {} units", def.starts.len().min(c.army.len()), c.army.len()), left.x + u, y, u * 0.8, DIM);
+        text(size, left.x + u, y, u * 0.8, DIM);
+        y += u * 1.0;
+        text(&format!("Deploy {} of {} units", slots.min(c.army.len()), c.army.len()), left.x + u, y, u * 0.8, DIM);
         y += u * 1.0;
         text(&format!("Gold: {}", c.gold), left.x + u, y, u * 0.85, ACCENT);
         y += u * 1.0;
         let mode = if c.permadeath { "Permadeath: ON" } else { "Permadeath: OFF" };
         text(mode, left.x + u, y, u * 0.8, if c.permadeath { BAD } else { DIM });
         y += u * 1.4;
-        let dep = c.deployment(def.starts.len());
+        let dep = c.deployment(slots);
         let size = (u * 2.6).min((left.w - u * 2.0) / 6.0);
         let mut x = left.x + u;
         for (k, unit) in c.army.iter().enumerate() {
@@ -148,13 +160,13 @@ impl PrepScreen {
         exit
     }
 
-    fn unit_list(&mut self, c: &Campaign, input: &mut Input, area: Rect, u: f32) {
+    fn unit_list(&mut self, c: &Campaign, input: &mut Input, area: Rect, u: f32, slots: usize) {
         let n = c.army.len().max(1);
         let cols = if n > 7 { 2 } else { 1 };
         let rows = n.div_ceil(cols);
         let bh = ((area.h - u * 3.0) / rows as f32 - u * 0.25).min(u * 2.0);
         let bw = (area.w - u * 0.5 * (cols - 1) as f32) / cols as f32;
-        let deployed = c.deployment(c.def().starts.len());
+        let deployed = c.deployment(slots);
         for (i, unit) in c.army.iter().enumerate() {
             let col = i / rows;
             let row = i % rows;
@@ -168,9 +180,9 @@ impl PrepScreen {
         }
     }
 
-    fn army(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32) {
+    fn army(&mut self, c: &mut Campaign, input: &mut Input, left: Rect, right: Rect, u: f32, slots: usize) {
         text("Army", left.x, left.y + u * 1.4, u * 1.4, ACCENT);
-        self.unit_list(c, input, left, u);
+        self.unit_list(c, input, left, u, slots);
         if c.army.is_empty() {
             return;
         }

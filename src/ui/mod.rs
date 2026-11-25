@@ -215,7 +215,7 @@ impl App {
         for (i, (class, weapon)) in party.iter().enumerate() {
             let x = march - i as f32 * tile * 1.1;
             let bob = ((self.time * 6.0) as i32 + i as i32) % 2 == 0;
-            gfx::draw_unit(UnitLook { class: *class, team: Team::Player, weapon: *weapon, boss: false }, x, gy - tile * 0.7, tile, false, 1.0, bob);
+            gfx::draw_unit(UnitLook::plain(*class, Team::Player, *weapon), x, gy - tile * 0.7, tile, false, 1.0, bob);
         }
 
         let cx = w / 2.0;

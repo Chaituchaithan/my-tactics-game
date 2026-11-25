@@ -7,7 +7,7 @@ use macroquad::prelude::*;
 use super::battle_screen::dialogue_box;
 use super::gfx::{self, UnitLook};
 use super::widgets::*;
-use crate::logic::campaign::{chapter, Line};
+use crate::logic::campaign::{chapter, setup, Line};
 use crate::logic::map::Map;
 use crate::logic::unit::Unit;
 use crate::logic::Pos;
@@ -25,11 +25,12 @@ pub struct StoryScreen {
 impl StoryScreen {
     pub fn new(lines: Vec<Line>, chapter_index: usize, heading: Option<String>, army: &[Unit]) -> StoryScreen {
         let def = chapter(chapter_index);
+        let st = setup(chapter_index);
         let mut looks = HashMap::new();
-        for u in def.enemies.iter().chain(def.joins.iter()).chain(army.iter()) {
+        for u in st.enemies.iter().chain(def.joins.iter()).chain(army.iter()) {
             looks.insert(u.name.clone(), UnitLook::of(u));
         }
-        StoryScreen { lines, idx: 0, t: 0.0, time: 0.0, heading, map: Map::from_rows(&def.map), looks }
+        StoryScreen { lines, idx: 0, t: 0.0, time: 0.0, heading, map: st.map, looks }
     }
 
     /// Returns true when the scene is over.

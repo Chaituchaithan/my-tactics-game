@@ -42,7 +42,7 @@ impl Script {
             match parts.as_slice() {
                 ["tap", x, y] => inject_tap(vec2(x.parse::<f32>().unwrap() * screen_width(), y.parse::<f32>().unwrap() * screen_height())),
                 ["tile", x, y] => {
-                    let l = Layout::compute(16, 12);
+                    let l = Layout::compute(16, 12, 1, Vec2::ZERO);
                     let r = l.tile_rect(x.parse().unwrap(), y.parse().unwrap());
                     inject_tap(r.center());
                 }

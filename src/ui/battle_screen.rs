@@ -115,6 +115,13 @@ pub struct BattleScreen {
     show_danger: bool,
     danger: Option<HashSet<Pos>>,
     time: f32,
+    cam: Vec2,
+    cam_target: Option<Vec2>,
+    zoom: usize,
+    /// Enemy phase fast-forward.
+    fast: bool,
+    /// Last layout, for camera decisions made outside drawing.
+    lay: Option<Layout>,
 }
 
 fn pv(p: Pos) -> Vec2 {
@@ -152,7 +159,16 @@ impl BattleScreen {
             show_danger: false,
             danger: None,
             time: 0.0,
+            cam: Vec2::ZERO,
+            cam_target: None,
+            zoom: 1,
+            fast: false,
+            lay: None,
         };
+        if let Some(lord) = s.b.units.iter().find(|u| u.is_lord) {
+            let l = Layout::compute(s.b.map.width, s.b.map.height, s.zoom, Vec2::ZERO);
+            s.cam = l.centred_on(pv(lord.pos));
+        }
         s.sync_vis();
         for a in s.vis_alpha.iter_mut() {
             *a = 1.0;
@@ -182,13 +198,33 @@ impl BattleScreen {
     }
 
     pub fn frame(&mut self) -> BattleExit {
-        let dt = get_frame_time().min(0.05);
-        self.time += dt;
+        let raw_dt = get_frame_time().min(0.05);
+        self.time += raw_dt;
         self.sync_vis();
-        let lay = Layout::compute(self.b.map.width, self.b.map.height);
         let mut input = Input::poll();
+        let mut lay = Layout::compute(self.b.map.width, self.b.map.height, self.zoom, self.cam);
 
+        // Camera: drag to pan, otherwise glide towards the follow target.
+        if let Some((start, delta)) = input.drag {
+            if lay.view().contains(start) {
+                self.cam = lay.cam - delta / lay.tile;
+                self.cam_target = None;
+            }
+        } else if let Some(t) = self.cam_target {
+            let d = t - self.cam;
+            self.cam += d * (raw_dt * 9.0).min(1.0);
+            if d.length() < 0.02 {
+                self.cam = t;
+                self.cam_target = None;
+            }
+        }
+        lay = Layout::compute(self.b.map.width, self.b.map.height, self.zoom, self.cam);
+        self.cam = lay.cam;
+        self.lay = Some(lay);
+
+        let dt = if self.fast && self.b.phase == Phase::Enemy { raw_dt * 3.0 } else { raw_dt };
         self.update_fx(dt, &mut input);
+        self.follow_fx(&lay);
         for f in &mut self.floats {
             f.t += dt;
         }
@@ -201,7 +237,11 @@ impl BattleScreen {
         }
 
         self.draw_map(&lay);
+        self.zoom_buttons(&lay, &mut input);
         let mut exit = self.panel(&lay, &mut input);
+        if self.b.phase == Phase::Enemy && input.take().is_some() {
+            self.fast = true;
+        }
         if self.fx.is_empty() {
             self.handle_map_tap(&lay, &mut input);
         }
@@ -212,6 +252,63 @@ impl BattleScreen {
             }
         }
         exit
+    }
+
+    // ---------------------------------------------------------------- camera
+
+    fn look_at(&mut self, p: Vec2) {
+        if let Some(l) = self.lay {
+            if !l.shows(p, 2.0) {
+                self.cam_target = Some(l.centred_on(p));
+            }
+        }
+    }
+
+    /// Keep the action on screen: moving units, fights, spawns.
+    fn follow_fx(&mut self, lay: &Layout) {
+        if !lay.scrollable() {
+            return;
+        }
+        let target = match self.fx.front() {
+            Some(Fx::Move { unit, path }) if self.fx_started || self.fx_t == 0.0 => {
+                let _ = unit;
+                path.last().map(|p| pv(*p))
+            }
+            Some(Fx::CombatBegin { d, .. }) => Some(self.vis_pos[*d]),
+            Some(Fx::Spawn { unit }) => Some(pv(self.b.units[*unit].pos)),
+            _ => None,
+        };
+        if let Some(p) = target {
+            if self.cam_target.is_none() && !lay.shows(p, 1.5) {
+                self.cam_target = Some(lay.centred_on(p));
+            }
+        }
+    }
+
+    fn zoom_buttons(&mut self, lay: &Layout, input: &mut Input) {
+        let u = lay.u;
+        let s = (u * 1.9).floor();
+        let x = lay.ox + u * 0.4;
+        let y = lay.oy + lay.map_h - s - u * 0.4;
+        let minus = Rect::new(x, y, s, s);
+        let plus = Rect::new(x + s + u * 0.3, y, s, s);
+        let zs = if self.zoom > 0 { ButtonStyle::Normal } else { ButtonStyle::Disabled };
+        let zp = if self.zoom + 1 < ZOOM_LEVELS { ButtonStyle::Normal } else { ButtonStyle::Disabled };
+        let centre = self.cam + lay.view_tiles() / 2.0;
+        let mut changed = false;
+        if button(input, minus, "-", zs, u) {
+            self.zoom -= 1;
+            changed = true;
+        }
+        if button(input, plus, "+", zp, u) {
+            self.zoom += 1;
+            changed = true;
+        }
+        if changed {
+            let l = Layout::compute(self.b.map.width, self.b.map.height, self.zoom, Vec2::ZERO);
+            self.cam = centre - l.view_tiles() / 2.0;
+            self.cam_target = None;
+        }
     }
 
     // ------------------------------------------------------------------ flow
@@ -350,6 +447,11 @@ impl BattleScreen {
             return Mode::EnemyPhase { queue };
         }
         let start = self.b.begin_phase(Phase::Player);
+        self.fast = false;
+        if let Some(lord) = self.b.units.iter().find(|u| u.is_lord && u.alive) {
+            let p = pv(lord.pos);
+            self.look_at(p);
+        }
         if self.b.outcome() == Outcome::Ongoing {
             self.fx.push_back(Fx::Banner { text: format!("Player Phase - Turn {}", self.b.turn), color: ALLY });
         }
@@ -576,7 +678,11 @@ impl BattleScreen {
                 text("Tap the target again to confirm.", inner.x, bottom, u * 0.6, DIM);
             }
             Mode::Target { .. } => {}
-            Mode::EnemyPhase { .. } => text("The enemy is moving...", inner.x, y, u * 0.9, DIM),
+            Mode::EnemyPhase { .. } => {
+                text("The enemy is moving...", inner.x, y, u * 0.9, DIM);
+                let hint = if self.fast { "Fast-forward on" } else { "Tap to fast-forward" };
+                text(hint, inner.x, y + u * 1.2, u * 0.75, if self.fast { ACCENT } else { DIM });
+            }
             Mode::Items { unit, .. } => {
                 let un = &self.b.units[*unit];
                 text(&format!("{}'s items", un.name), inner.x, y, u, ALLY);
@@ -937,8 +1043,9 @@ impl BattleScreen {
 
     fn draw_map(&self, lay: &Layout) {
         let m = &self.b.map;
-        for y in 0..m.height {
-            for x in 0..m.width {
+        let (vx0, vy0, vx1, vy1) = lay.visible();
+        for y in vy0..=vy1 {
+            for x in vx0..=vx1 {
                 let p = Pos::new(x, y);
                 let r = lay.tile_rect(x as f32, y as f32);
                 let visited = self.b.village_at(p).is_some_and(|v| v.visited);
@@ -946,13 +1053,17 @@ impl BattleScreen {
             }
         }
         let gc = Color::new(0.0, 0.0, 0.0, 0.12);
-        for x in 0..=m.width {
-            let px = lay.ox + x as f32 * lay.tile;
-            draw_line(px, lay.oy, px, lay.oy + lay.map_h, 1.0, gc);
+        for x in vx0..=vx1 + 1 {
+            let px = lay.tile_rect(x as f32, 0.0).x;
+            if px >= lay.ox && px <= lay.ox + lay.map_w {
+                draw_line(px, lay.oy, px, lay.oy + lay.map_h, 1.0, gc);
+            }
         }
-        for y in 0..=m.height {
-            let py = lay.oy + y as f32 * lay.tile;
-            draw_line(lay.ox, py, lay.ox + lay.map_w, py, 1.0, gc);
+        for y in vy0..=vy1 + 1 {
+            let py = lay.tile_rect(0.0, y as f32).y;
+            if py >= lay.oy && py <= lay.oy + lay.map_h {
+                draw_line(lay.ox, py, lay.ox + lay.map_w, py, 1.0, gc);
+            }
         }
         if let Objective::Seize(p) = self.b.objective {
             let a = 0.5 + 0.5 * (self.time * 3.0).sin();
@@ -1010,6 +1121,9 @@ impl BattleScreen {
             }
             let un = &self.b.units[i];
             let v = self.draw_pos(i);
+            if v.x < lay.cam.x - 1.0 || v.y < lay.cam.y - 1.0 || v.x > lay.cam.x + lay.view_tiles().x || v.y > lay.cam.y + lay.view_tiles().y {
+                continue;
+            }
             let r = lay.tile_rect(v.x, v.y);
             let moving = matches!(self.mode, Mode::Selected { unit, .. } if unit == i);
             let bob = !un.done && (((self.time * if moving { 6.0 } else { 2.0 }) + i as f32 * 0.37) as i32 % 2 == 0);
@@ -1046,6 +1160,24 @@ impl BattleScreen {
             let mut c = f.color;
             c.a = (1.0 - f.t).clamp(0.0, 1.0);
             text_centered(&f.text, r.x + r.w / 2.0, r.y + r.h * 0.2, lay.tile * 0.42, c);
+        }
+
+        // Hide anything scrolled outside the viewport.
+        let bg = rgb(16, 16, 30);
+        let (sw, sh) = (screen_width(), screen_height());
+        draw_rectangle(0.0, 0.0, sw, lay.oy, bg);
+        draw_rectangle(0.0, lay.oy + lay.map_h, sw, sh, bg);
+        draw_rectangle(0.0, 0.0, lay.ox, sh, bg);
+        draw_rectangle(lay.ox + lay.map_w, 0.0, sw, sh, bg);
+        if lay.scrollable() {
+            // Scroll position indicators.
+            let v = lay.view_tiles();
+            let bw = lay.map_w * (v.x / lay.cols as f32).min(1.0);
+            let bx = lay.ox + lay.map_w * (lay.cam.x / lay.cols as f32);
+            draw_rectangle(bx, lay.oy + lay.map_h - 4.0, bw, 4.0, Color::new(1.0, 1.0, 1.0, 0.35));
+            let bh = lay.map_h * (v.y / lay.rows as f32).min(1.0);
+            let by = lay.oy + lay.map_h * (lay.cam.y / lay.rows as f32);
+            draw_rectangle(lay.ox + lay.map_w - 4.0, by, 4.0, bh, Color::new(1.0, 1.0, 1.0, 0.35));
         }
     }
 

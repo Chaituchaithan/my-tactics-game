@@ -3,18 +3,32 @@
 An original retro tactical RPG for Android (and desktop), written in Rust with [macroquad](https://macroquad.rs).
 All art is pixel art drawn in code; no external assets.
 
-A complete 8-chapter campaign:
+A complete 16-chapter campaign in two acts. Map size follows the story, from cramped passes to a whole capital city:
 
-| # | Chapter | Objective | Notes |
-|---|---|---|---|
-| 1 | The Ashford Crossing | Defeat Varga | Tutorial-sized; a village to visit |
-| 2 | Ember Woods | Rout | Holt joins; talk to **Dain** to recruit him; reinforcements |
-| 3 | Hollowmere Must Stand | Survive 6 turns | Sera joins; enemies pour in from every side |
-| 4 | Saltmarsh Keep | Seize the throne | Talk to **Ilse**; a Master Seal in the village |
-| 5 | Ironpeak Pass | Defeat Thorne | Maeve joins; mountain warfare |
-| 6 | The Ashen Wall | Rout | Bram joins; promoted enemy classes |
-| 7 | The Burning Bridge | Survive 7 turns | Talk to **Corvin**; hold the bridge |
-| 8 | Throne of Ash | Defeat Morvaine | Final battle, then the ending |
+| # | Chapter | Map | Objective | Notes |
+|---|---|---|---|---|
+| 1 | The Ashford Crossing | Small | Defeat Varga | Hand-made map |
+| 2 | Ember Woods | Small | Rout | Holt joins; talk to **Dain** |
+| 3 | Hollowmere Must Stand | Small | Survive 6 turns | Sera joins |
+| 4 | Saltmarsh Keep | Small | Seize | Talk to **Ilse** |
+| 5 | The Drowned Road | Medium | Defeat Oskar | Marshland; Wren joins |
+| 6 | Ironpeak Pass | Small | Defeat Thorne | Narrow mountain pass; Maeve joins |
+| 7 | The Frozen Vigil | Medium | Seize | Monastery ruins; Aldous joins |
+| 8 | The Ashen Wall | Large | Rout | Bram joins |
+| 9 | The Burning Bridge | Large | Survive 7 turns | Talk to **Corvin** |
+| 10 | Siege of Dawnhold | Extra Large | Defeat Kreth | The capital; talk to **Rhea** |
+| 11 | Throne of Ash | Medium | Defeat Morvaine | End of Act I |
+| 12 | The Frostmarch | Large | Survive 8 turns | Act II; Toma joins; enemies from all sides |
+| 13 | Vault of Embers | Medium | Seize | Talk to **Seren** |
+| 14 | The Shattered Coast | Extra Large | Rout | The Pale Fleet |
+| 15 | The Hollow Bastion | Large | Defeat Ysolde | |
+| 16 | Heart of Winter | Extra Large | Defeat Vaelith | Final battle |
+
+Map sizes: Small 16×12, Medium 22×15, Large 28×18, Extra Large 34×22. Enemy numbers scale with the map, from about 8 to about 30. Chapters 5–16 use a deterministic map generator (`logic/mapgen.rs`). Each chapter describes a theme and its features (river and bridges, castle with gates/rooms/throne, forests, mountains, marsh, ruins, villages, forts) and always produces the same map. Tests check that every map can be played through.
+
+**Camera:** drag the map to pan. Use **-/+** to switch between the whole map, the normal view and a close-up. The camera follows moving enemies, and tapping during the enemy phase fast-forwards it.
+
+**Art:** every sprite, portrait and tile is pixel art drawn in code: 32×32 units with outlines and 3-tone shading, varied hair and skin per character, 48×48 face portraits, and detailed terrain. Sprites are cached as textures.
 
 Between chapters you get a **story scene** and a **preparations screen**: army and inventories (equip, discard, give items, use Master Seals, reorder who deploys) and an **armory** that sells weapons, staves and consumables. Progress **auto-saves** before each battle. Choose **Continue** on the title screen to resume.
 
@@ -49,9 +63,10 @@ src/logic/        pure game rules, no rendering (unit-tested)
   items.rs        weapon/item catalogue and shop list
   ai.rs           enemy decision making
   battle.rs       battle state: phases, objectives, reinforcements, villages, talk, items
-  campaign.rs     the 8 chapters (maps, rosters, story) and the saved campaign state
+  campaign.rs     the 16 chapters (story, rosters, map recipes) and the saved campaign state
+  mapgen.rs       deterministic map generator
 src/ui/           macroquad rendering and input
-  gfx.rs          code-drawn pixel art (terrain, units)
+  gfx.rs          code-drawn pixel art (terrain, units, portraits), cached as textures
   battle_screen.rs input state machine, animation queue, panel, forecast
   story.rs        dialogue scenes
   prep.rs         preparations: army, items, shop
@@ -63,7 +78,8 @@ src/ui/           macroquad rendering and input
 
 ```sh
 cargo run --release   # play
-cargo test            # 70 tests: combat, pathfinding, AI, items, campaign, plus an auto-battle of every chapter
+cargo test            # 73 tests: combat, pathfinding, AI, items, maps, campaign
+cargo test --release -- --ignored --nocapture   # auto-battle all 16 chapters
 ```
 
 ## Building the APK

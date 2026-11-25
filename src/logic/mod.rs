@@ -7,6 +7,7 @@ pub mod campaign;
 pub mod combat;
 pub mod items;
 pub mod map;
+pub mod mapgen;
 pub mod pathfinding;
 pub mod rng;
 pub mod terrain;

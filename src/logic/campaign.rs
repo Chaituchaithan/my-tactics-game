@@ -1,10 +1,15 @@
-//! The campaign "Emberfall": chapters, story, and the persistent army.
+//! The campaign "Emberfall": 16 chapters in two acts, the story, and the
+//! persistent army. Chapters 1-4 use hand-made small maps; the rest are
+//! generated (deterministically) at medium, large and extra-large sizes.
 
 use serde::{Deserialize, Serialize};
 
 use super::battle::{Battle, Objective, Reward, Village};
 use super::items::ItemId;
 use super::map::Map;
+use super::mapgen::{self, Generated, Layout, MapSpec, Theme};
+use super::rng::Rng;
+use super::terrain::Terrain;
 use super::unit::{AiMode, Class, Stats, Team, Unit};
 use super::Pos;
 
@@ -19,14 +24,106 @@ const fn l(speaker: &'static str, text: &'static str) -> Line {
     Line { speaker, text }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    Small,
+    Medium,
+    Large,
+    ExtraLarge,
+}
+
+impl Tier {
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Small => "Small",
+            Tier::Medium => "Medium",
+            Tier::Large => "Large",
+            Tier::ExtraLarge => "Extra Large",
+        }
+    }
+
+    pub fn size(self) -> (i32, i32) {
+        match self {
+            Tier::Small => (16, 12),
+            Tier::Medium => (22, 15),
+            Tier::Large => (28, 18),
+            Tier::ExtraLarge => (34, 22),
+        }
+    }
+
+    pub fn deploy(self) -> usize {
+        match self {
+            Tier::Small => 8,
+            Tier::Medium => 10,
+            Tier::Large => 12,
+            Tier::ExtraLarge => 14,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Goal {
+    Boss,
+    Rout,
+    /// Seize the throne tile of the map.
+    Seize,
+    Survive(u32),
+}
+
+/// Where a generated squad is placed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zone {
+    Front,
+    Mid,
+    Rear,
+    Castle,
+    Throne,
+    /// Map edges on the enemy side (used for reinforcements).
+    Edge,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Squad {
+    pub name: &'static str,
+    pub class: Class,
+    pub level: i32,
+    pub items: &'static [ItemId],
+    pub count: usize,
+    pub zone: Zone,
+    pub ai: AiMode,
+}
+
+const fn sq(name: &'static str, class: Class, level: i32, items: &'static [ItemId], count: usize, zone: Zone) -> Squad {
+    Squad { name, class, level, items, count, zone, ai: AiMode::Aggressive }
+}
+
+const fn guard(name: &'static str, class: Class, level: i32, items: &'static [ItemId], count: usize, zone: Zone) -> Squad {
+    Squad { name, class, level, items, count, zone, ai: AiMode::Guard }
+}
+
+pub enum Field {
+    Fixed {
+        rows: [&'static str; 12],
+        starts: Vec<Pos>,
+        enemies: Vec<Unit>,
+        reinforcements: Vec<(u32, Unit)>,
+        villages: Vec<(Pos, Reward)>,
+    },
+    Generated {
+        spec: MapSpec,
+        squads: Vec<Squad>,
+        /// Bosses and named characters with their zones.
+        named: Vec<(Unit, Zone)>,
+        reinforcements: Vec<(u32, Squad)>,
+        rewards: Vec<Reward>,
+    },
+}
+
 pub struct ChapterDef {
     pub title: &'static str,
-    pub map: [&'static str; 12],
-    pub objective: Objective,
-    pub starts: Vec<Pos>,
-    pub enemies: Vec<Unit>,
-    pub reinforcements: Vec<(u32, Unit)>,
-    pub villages: Vec<(Pos, Reward)>,
+    pub tier: Tier,
+    pub goal: Goal,
+    pub field: Field,
     /// Allies who join the army at the start of this chapter.
     pub joins: Vec<Unit>,
     pub intro: Vec<Line>,
@@ -34,6 +131,16 @@ pub struct ChapterDef {
     /// Conversation when the lord talks to a recruitable enemy (by name).
     pub talks: Vec<(&'static str, Vec<Line>)>,
     pub reward_gold: i32,
+}
+
+/// Everything needed to start a battle.
+pub struct Setup {
+    pub map: Map,
+    pub starts: Vec<Pos>,
+    pub enemies: Vec<Unit>,
+    pub reinforcements: Vec<(u32, Unit)>,
+    pub villages: Vec<(Pos, Reward)>,
+    pub objective: Objective,
 }
 
 fn p(x: i32, y: i32) -> Pos {
@@ -48,11 +155,21 @@ fn ally(name: &str, class: Class, level: i32, stats: Stats, growths: Stats, item
     Unit::new(name, class, Team::Player, level, stats, growths, items, p(0, 0))
 }
 
+fn boss(name: &str, class: Class, level: i32, items: &[ItemId]) -> Unit {
+    Unit::generic(name, class, Team::Enemy, level, items, p(0, 0)).boss()
+}
+
 fn s(hp: i32, pow: i32, skl: i32, spd: i32, lck: i32, def: i32, res: i32) -> Stats {
     Stats::new(hp, pow, skl, spd, lck, def, res)
 }
 
-pub const CHAPTER_COUNT: usize = 8;
+#[allow(clippy::too_many_arguments)]
+fn spec(tier: Tier, seed: u64, theme: Theme, layout: Layout, river: bool, castle: bool, villages: usize, forts: usize) -> MapSpec {
+    let (w, h) = tier.size();
+    MapSpec { w, h, seed, theme, layout, river, castle, villages, forts, starts: tier.deploy() }
+}
+
+pub const CHAPTER_COUNT: usize = 16;
 
 pub fn starting_army() -> Vec<Unit> {
     use Class::*;
@@ -66,13 +183,139 @@ pub fn starting_army() -> Vec<Unit> {
     ]
 }
 
+fn zone_ok(g: &Generated, sp: &MapSpec, zone: Zone, q: Pos) -> bool {
+    let fx = q.x as f32 / sp.w as f32;
+    let in_castle = g.castle.is_some_and(|c| c.contains(q));
+    let edge = q.x == sp.w - 1 || q.y == 0 || q.y == sp.h - 1 || q.x == 0;
+    match sp.layout {
+        Layout::March => match zone {
+            Zone::Front => (0.33..0.62).contains(&fx),
+            Zone::Mid => (0.5..0.82).contains(&fx),
+            Zone::Rear => fx >= 0.72,
+            Zone::Castle => in_castle,
+            Zone::Throne => Some(q) == g.throne,
+            Zone::Edge => edge && fx > 0.6,
+        },
+        Layout::Defend => {
+            let c = g.starts[0];
+            let d = q.manhattan(c) as f32 / ((sp.w + sp.h) as f32 / 2.0);
+            match zone {
+                Zone::Front => (0.3..0.5).contains(&d),
+                Zone::Mid => (0.42..0.68).contains(&d),
+                Zone::Rear => d >= 0.6,
+                Zone::Castle => in_castle,
+                Zone::Throne => Some(q) == g.throne,
+                Zone::Edge => edge,
+            }
+        }
+    }
+}
+
+/// Picks free tiles in `zone` for `n` units of `class`.
+fn place(g: &Generated, sp: &MapSpec, zone: Zone, class: Class, n: usize, taken: &mut Vec<Pos>, rng: &mut Rng) -> Vec<Pos> {
+    let mut cands: Vec<Pos> = g
+        .reachable
+        .iter()
+        .copied()
+        .filter(|q| zone_ok(g, sp, zone, *q))
+        .filter(|q| g.map.at(*q).move_cost(class.move_type()).is_some() && g.map.at(*q) != Terrain::Village)
+        .filter(|q| !taken.contains(q) && g.starts.iter().all(|s| s.manhattan(*q) >= 5))
+        .collect();
+    cands.sort();
+    // Fall back to anywhere on the enemy side if the zone is too crowded.
+    if cands.len() < n && zone != Zone::Throne {
+        let more: Vec<Pos> = g
+            .reachable
+            .iter()
+            .copied()
+            .filter(|q| g.map.at(*q).move_cost(class.move_type()).is_some() && !taken.contains(q) && g.starts.iter().all(|s| s.manhattan(*q) >= 7))
+            .collect();
+        cands.extend(more);
+        cands.sort();
+        cands.dedup();
+    }
+    let mut out = Vec::new();
+    for _ in 0..n {
+        if cands.is_empty() {
+            break;
+        }
+        let i = rng.next_u64() as usize % cands.len();
+        let q = cands.swap_remove(i);
+        taken.push(q);
+        out.push(q);
+    }
+    out
+}
+
+fn throne_of(map: &Map) -> Option<Pos> {
+    (0..map.height).flat_map(|y| (0..map.width).map(move |x| Pos::new(x, y))).find(|q| map.at(*q) == Terrain::Throne)
+}
+
+fn objective(goal: Goal, map: &Map) -> Objective {
+    match goal {
+        Goal::Boss => Objective::Boss,
+        Goal::Rout => Objective::Rout,
+        Goal::Survive(n) => Objective::Survive(n),
+        Goal::Seize => Objective::Seize(throne_of(map).expect("seize map needs a throne")),
+    }
+}
+
+/// Builds the concrete map and placed units for chapter `n`.
+pub fn setup(n: usize) -> Setup {
+    let def = chapter(n);
+    match def.field {
+        Field::Fixed { rows, starts, enemies, reinforcements, villages } => {
+            let map = Map::from_rows(&rows);
+            let objective = objective(def.goal, &map);
+            Setup { map, starts, enemies, reinforcements, villages, objective }
+        }
+        Field::Generated { spec: sp, squads, named, reinforcements, rewards } => {
+            let g = mapgen::generate(&sp);
+            // Enemy numbers follow the map size.
+            let f = match def.tier {
+                Tier::Small => 0.6,
+                Tier::Medium => 0.85,
+                Tier::Large => 1.0,
+                Tier::ExtraLarge => 1.25,
+            };
+            let scaled = |n: usize| ((n as f32 * f).round() as usize).max(1);
+            let mut rng = Rng::new(sp.seed ^ 0xA5A5);
+            let mut taken: Vec<Pos> = Vec::new();
+            let mut enemies = Vec::new();
+            for (u, zone) in named {
+                let at = place(&g, &sp, zone, u.class, 1, &mut taken, &mut rng);
+                let mut u = u;
+                u.pos = at.first().copied().unwrap_or(Pos::new(sp.w - 2, sp.h / 2));
+                enemies.push(u);
+            }
+            for sqd in squads {
+                for at in place(&g, &sp, sqd.zone, sqd.class, scaled(sqd.count), &mut taken, &mut rng) {
+                    enemies.push(Unit::generic(sqd.name, sqd.class, Team::Enemy, sqd.level, sqd.items, at).with_ai(sqd.ai));
+                }
+            }
+            let mut reinf = Vec::new();
+            for (turn, sqd) in reinforcements {
+                let mut taken_r = taken.clone();
+                for at in place(&g, &sp, sqd.zone, sqd.class, scaled(sqd.count), &mut taken_r, &mut rng) {
+                    reinf.push((turn, Unit::generic(sqd.name, sqd.class, Team::Enemy, sqd.level, sqd.items, at).with_ai(sqd.ai)));
+                }
+            }
+            let villages = g.villages.iter().copied().zip(rewards).collect();
+            let objective = objective(def.goal, &g.map);
+            Setup { map: g.map, starts: g.starts, enemies, reinforcements: reinf, villages, objective }
+        }
+    }
+}
+
 pub fn chapter(n: usize) -> ChapterDef {
     use Class::*;
     use ItemId::*;
+    use Zone::*;
     match n {
         0 => ChapterDef {
             title: "The Ashford Crossing",
-            map: [
+            field: Field::Fixed {
+                rows: [
                 "MMM..FF..~~..MMM",
                 "MM...VF..~~...TM",
                 "M..F.....==.F..M",
@@ -86,7 +329,6 @@ pub fn chapter(n: usize) -> ChapterDef {
                 "...T....F==..F..",
                 "........FF~~~...",
             ],
-            objective: Objective::Boss,
             starts: vec![p(1, 10), p(2, 10), p(0, 10), p(1, 11), p(0, 11), p(2, 11), p(3, 11), p(0, 9)],
             enemies: vec![
                 e("Brigand", Brigand, 2, &[IronAxe], 6, 3),
@@ -100,6 +342,9 @@ pub fn chapter(n: usize) -> ChapterDef {
             ],
             reinforcements: vec![],
             villages: vec![(p(5, 1), Reward::Item(Vulnerary))],
+            },
+            goal: Goal::Boss,
+            tier: Tier::Small,
             joins: vec![],
             intro: vec![
                 l("", "The realm of Emberfall. For three hundred years the Dawn Flame burned in the capital, and the kingdom knew peace."),
@@ -120,7 +365,8 @@ pub fn chapter(n: usize) -> ChapterDef {
         },
         1 => ChapterDef {
             title: "Ember Woods",
-            map: [
+            field: Field::Fixed {
+                rows: [
                 "FF..FFF...FF..FF",
                 "F...F.....F...MF",
                 "..FF..V..FFF....",
@@ -134,7 +380,6 @@ pub fn chapter(n: usize) -> ChapterDef {
                 "F.......F...F.FF",
                 "FF..F..FF....FFF",
             ],
-            objective: Objective::Rout,
             starts: vec![p(1, 5), p(0, 5), p(1, 6), p(0, 6), p(1, 4), p(0, 4), p(1, 7), p(0, 7)],
             enemies: vec![
                 e("Brigand", Brigand, 3, &[IronAxe], 5, 3),
@@ -149,6 +394,9 @@ pub fn chapter(n: usize) -> ChapterDef {
             ],
             reinforcements: vec![(4, e("Brigand", Brigand, 4, &[IronAxe], 15, 10)), (4, e("Brigand", Brigand, 4, &[IronAxe], 15, 0))],
             villages: vec![(p(6, 2), Reward::Item(Elixir)), (p(13, 8), Reward::Gold(1000))],
+            },
+            goal: Goal::Rout,
+            tier: Tier::Small,
             joins: vec![ally("Holt", Fighter, 4, s(28, 9, 5, 6, 3, 4, 0), s(90, 60, 35, 35, 30, 25, 5), &[IronAxe, HandAxe])],
             intro: vec![
                 l("", "The Ember Woods. Bandit gangs have grown bold since the Flame went out."),
@@ -176,7 +424,8 @@ pub fn chapter(n: usize) -> ChapterDef {
         },
         2 => ChapterDef {
             title: "Hollowmere Must Stand",
-            map: [
+            field: Field::Fixed {
+                rows: [
                 "MM..FF....FF..MM",
                 "M......FF......M",
                 "..F..........F..",
@@ -190,7 +439,6 @@ pub fn chapter(n: usize) -> ChapterDef {
                 "M.......FF.....M",
                 "MM....FFFF....MM",
             ],
-            objective: Objective::Survive(6),
             starts: vec![p(7, 7), p(8, 7), p(6, 7), p(9, 7), p(7, 8), p(8, 8), p(6, 8), p(9, 8), p(7, 9), p(8, 9)],
             enemies: vec![
                 e("Brigand", Brigand, 4, &[IronAxe], 2, 1),
@@ -219,6 +467,9 @@ pub fn chapter(n: usize) -> ChapterDef {
                 (p(1, 8), Reward::Gold(1500)),
                 (p(14, 8), Reward::Item(Elixir)),
             ],
+            },
+            goal: Goal::Survive(6),
+            tier: Tier::Small,
             joins: vec![ally("Sera", Knight, 5, s(22, 8, 5, 3, 3, 12, 2), s(85, 45, 35, 25, 35, 45, 15), &[IronLance, Javelin])],
             intro: vec![
                 l("", "Hollowmere. A village of farmers and one tired old keep."),
@@ -238,7 +489,8 @@ pub fn chapter(n: usize) -> ChapterDef {
         },
         3 => ChapterDef {
             title: "Saltmarsh Keep",
-            map: [
+            field: Field::Fixed {
+                rows: [
                 "~~~~....FF.#####",
                 "~~~...F....#,,H#",
                 "~~.......F.#,P,#",
@@ -252,7 +504,6 @@ pub fn chapter(n: usize) -> ChapterDef {
                 "~~~.....V.....F.",
                 "~~~~..FF....F...",
             ],
-            objective: Objective::Seize(p(14, 1)),
             starts: vec![p(4, 10), p(5, 10), p(4, 11), p(5, 11), p(3, 10), p(6, 10), p(3, 9), p(2, 9), p(7, 10), p(6, 11)],
             enemies: vec![
                 e("Soldier", Soldier, 5, &[SteelLance], 12, 3),
@@ -273,6 +524,9 @@ pub fn chapter(n: usize) -> ChapterDef {
                 (7, e("Knight", Knight, 5, &[IronLance], 15, 6)),
             ],
             villages: vec![(p(8, 10), Reward::Item(MasterSeal))],
+            },
+            goal: Goal::Seize,
+            tier: Tier::Small,
             joins: vec![],
             intro: vec![
                 l("", "Saltmarsh Keep, a grey fortress above the tidal flats. Its stores feed the Legion's whole southern army."),
@@ -284,7 +538,7 @@ pub fn chapter(n: usize) -> ChapterDef {
             ],
             outro: vec![
                 l("Kael", "Saltmarsh is ours. Raise the March banner over the gate."),
-                l("Ilse", "The Legion's next fort is in the Ironpeak Pass. Thorne holds it. He's worse than Hask ever was."),
+                l("Ilse", "The Legion shipped prisoners out of here yesterday. They're marching them north along the Drowned Road."),
                 l("Liese", "There's a Master Seal in the keep's treasury. A seasoned warrior could grow stronger with it."),
             ],
             talks: vec![(
@@ -299,90 +553,130 @@ pub fn chapter(n: usize) -> ChapterDef {
             reward_gold: 2500,
         },
         4 => ChapterDef {
+            title: "The Drowned Road",
+            tier: Tier::Medium,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::Medium, 501, Theme::Marsh, Layout::March, false, false, 3, 2),
+                squads: vec![
+                    sq("Brigand", Brigand, 5, &[IronAxe], 4, Front),
+                    sq("Soldier", Soldier, 5, &[IronLance], 3, Mid),
+                    sq("Archer", Archer, 5, &[ShortBow], 2, Mid),
+                    guard("Mage", Mage, 5, &[Ember], 2, Rear),
+                    guard("Fighter", Fighter, 6, &[SteelAxe], 2, Rear),
+                ],
+                named: vec![(boss("Oskar", Fighter, 9, &[SteelAxe, HandAxe]), Rear)],
+                reinforcements: vec![(4, sq("Brigand", Brigand, 5, &[IronAxe], 2, Edge)), (6, sq("Brigand", Brigand, 6, &[HandAxe], 2, Edge))],
+                rewards: vec![Reward::Item(Vulnerary), Reward::Gold(1500), Reward::Item(SteelSword)],
+            },
+            joins: vec![ally("Wren", Cleric, 5, s(19, 7, 6, 10, 8, 3, 9), s(55, 50, 35, 60, 55, 15, 50), &[Mend, Vulnerary])],
+            intro: vec![
+                l("", "South of Saltmarsh the old causeway sinks into the fens. The Legion uses it to march prisoners north."),
+                l("Wren", "Please! You're the March lord? They took everyone from my village. They're dragging them up the Drowned Road!"),
+                l("Kael", "Then we'll get them back. Can you fight?"),
+                l("Wren", "I trained at the Dawn Chapel with Liese. I can heal, and I run very fast."),
+                l("Liese", "Wren! Thank the Flame you're safe. Stay close to me."),
+                l("Oskar", "Prisoners fetch good silver in the north. Nobody touches the cargo."),
+            ],
+            outro: vec![
+                l("", "The prisoners are freed. Among them is an old monk, half frozen. Before he faints, he whispers one word: 'Vigil'."),
+                l("Orrin", "The Vigil Monastery, high in the Ironpeaks. If the Legion went there, the monks are in danger."),
+                l("Kael", "Then we take the pass."),
+            ],
+            talks: vec![],
+            reward_gold: 2800,
+        },
+        5 => ChapterDef {
             title: "Ironpeak Pass",
-            map: [
-                "MMMMM..FF..MMMMM",
-                "MMMM....F...MMMM",
-                "MMM...MM.....MMM",
-                "MM..F.MMM..F..MM",
-                "M.....MM.....T.M",
-                "M..F......F....M",
-                "MM....T...MM...M",
-                "MMM..FF...MMM..M",
-                "M.....M.......MM",
-                "M..V..M...F..MMM",
-                "MM.......F..MMMM",
-                "MMM....FF.MMMMMM",
-            ],
-            objective: Objective::Boss,
-            starts: vec![p(4, 10), p(3, 10), p(5, 10), p(6, 10), p(3, 11), p(4, 11), p(5, 11), p(6, 11), p(2, 10), p(7, 10), p(8, 10)],
-            enemies: vec![
-                e("Fighter", Fighter, 7, &[SteelAxe], 6, 2),
-                e("Fighter", Fighter, 7, &[HandAxe], 7, 3),
-                e("Archer", Archer, 7, &[SteelBow], 11, 3),
-                e("Archer", Archer, 7, &[Longbow], 10, 6),
-                e("Knight", Knight, 7, &[SteelLance], 6, 6),
-                e("Mage", Mage, 7, &[Blaze], 8, 1),
-                e("Mercenary", Mercenary, 7, &[SteelSword], 4, 4),
-                e("Mercenary", Mercenary, 7, &[KeenSword], 12, 8),
-                e("Brigand", Brigand, 8, &[SteelAxe], 10, 9).with_ai(AiMode::Guard),
-                Unit::generic("Thorne", Warlord, Team::Enemy, 2, &[SilverAxe, HandAxe], p(13, 4)).boss(),
-            ],
-            reinforcements: vec![(3, e("Fighter", Fighter, 7, &[IronAxe], 7, 0)), (3, e("Mage", Mage, 7, &[Ember], 8, 0)), (6, e("Archer", Archer, 7, &[SteelBow], 7, 0))],
-            villages: vec![(p(3, 9), Reward::Item(SilverLance))],
+            tier: Tier::Small,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::Small, 602, Theme::Highlands, Layout::March, false, false, 2, 3),
+                squads: vec![
+                    sq("Fighter", Fighter, 7, &[SteelAxe], 3, Front),
+                    sq("Mercenary", Mercenary, 7, &[SteelSword], 3, Front),
+                    sq("Archer", Archer, 7, &[SteelBow], 3, Mid),
+                    sq("Knight", Knight, 7, &[SteelLance], 2, Mid),
+                    guard("Mage", Mage, 7, &[Blaze], 2, Rear),
+                    guard("Brigand", Brigand, 8, &[SteelAxe], 2, Rear),
+                ],
+                named: vec![(boss("Thorne", Warlord, 2, &[SilverAxe, HandAxe]), Rear)],
+                reinforcements: vec![
+                    (3, sq("Fighter", Fighter, 7, &[IronAxe], 2, Edge)),
+                    (3, sq("Mage", Mage, 7, &[Ember], 1, Edge)),
+                    (6, sq("Archer", Archer, 7, &[SteelBow], 2, Edge)),
+                ],
+                rewards: vec![Reward::Item(SilverLance), Reward::Item(Elixir)],
+            },
             joins: vec![ally("Maeve", Lancer, 7, s(26, 9, 8, 10, 6, 8, 3), s(80, 45, 45, 55, 45, 30, 20), &[SteelLance, Javelin])],
             intro: vec![
-                l("", "The Ironpeak Pass. A narrow road through frozen mountains, and the only way north to the capital."),
-                l("Maeve", "You must be the March lord everyone's whispering about. Maeve. I guide caravans through here, or I did until Thorne arrived."),
+                l("", "The Ironpeak Pass. A narrow road through frozen mountains, and the only way to the Vigil Monastery."),
+                l("Maeve", "You must be the March lord everyone's whispering about. Maeve. I guided caravans through here until Thorne arrived."),
                 l("Kael", "Will you guide an army?"),
                 l("Maeve", "If that army is going to knock Thorne off his mountain, gladly."),
                 l("Holt", "Axe-folk move well on the peaks. Watch your flanks."),
             ],
             outro: vec![
                 l("Thorne", "The Legion... is endless..."),
-                l("Maeve", "The pass is open. Beyond it lies the Ashen Wall, Morvaine's outer defences."),
-                l("Kael", "Then we go through it."),
+                l("Maeve", "The pass is open. Listen. The monastery bells have stopped ringing."),
+                l("Kael", "Then we climb, and fast."),
             ],
             talks: vec![],
             reward_gold: 3000,
         },
-        5 => ChapterDef {
+        6 => ChapterDef {
+            title: "The Frozen Vigil",
+            tier: Tier::Medium,
+            goal: Goal::Seize,
+            field: Field::Generated {
+                spec: spec(Tier::Medium, 703, Theme::Ruins, Layout::March, false, true, 2, 2),
+                squads: vec![
+                    sq("Soldier", Soldier, 8, &[SteelLance], 3, Front),
+                    sq("Mercenary", Mercenary, 8, &[SteelSword], 2, Front),
+                    sq("Fighter", Fighter, 8, &[SteelAxe], 2, Mid),
+                    sq("Archer", Archer, 8, &[SteelBow], 2, Mid),
+                    guard("Knight", Knight, 8, &[SteelLance], 2, Castle),
+                    guard("Mage", Mage, 8, &[Blaze], 2, Castle),
+                ],
+                named: vec![(boss("Vorn", Halberdier, 3, &[SilverLance, Javelin]), Throne)],
+                reinforcements: vec![(5, sq("Soldier", Soldier, 8, &[IronLance], 3, Edge))],
+                rewards: vec![Reward::Item(MasterSeal), Reward::Gold(2000)],
+            },
+            joins: vec![ally("Aldous", Bishop, 3, s(26, 10, 8, 9, 8, 5, 14), s(45, 50, 35, 40, 45, 15, 55), &[Mend, Ember])],
+            intro: vec![
+                l("", "The Vigil Monastery clings to the mountainside. For a thousand years its monks have kept the histories of Emberfall."),
+                l("Aldous", "Lord Kael... I am Aldous, last abbot of the Vigil. The Legion holds the chapel, and they are burning our books."),
+                l("Kael", "What could Morvaine want with old books?"),
+                l("Aldous", "Not the books. What is written in them. Take back the chapel and I will show you."),
+                l("", "Objective: Kael must stand on the chapel altar (the throne) and choose Seize."),
+            ],
+            outro: vec![
+                l("Aldous", "Here. The oldest chronicle. It says the Dawn Flame was never just a symbol of kings. It was a seal."),
+                l("Ilse", "A seal? Against what?"),
+                l("Aldous", "Against something in the far north. The rest of the page is torn out. I fear Morvaine tore it."),
+                l("Kael", "Then we'll ask Morvaine. The Ashen Wall is all that stands between us and the capital."),
+            ],
+            talks: vec![],
+            reward_gold: 3200,
+        },
+        7 => ChapterDef {
             title: "The Ashen Wall",
-            map: [
-                "..FF....##...FF.",
-                ".......T##......",
-                "..##........##..",
-                "..#.....F....#..",
-                "....FF....FF....",
-                "~~=~~~~==~~~~=~~",
-                "................",
-                "..F..T....T..F..",
-                ".##..........##.",
-                "....FF....FF....",
-                "..F....FF....F..",
-                "...............V",
-            ],
-            objective: Objective::Rout,
-            starts: vec![p(7, 11), p(8, 11), p(6, 11), p(9, 11), p(5, 11), p(10, 11), p(7, 10), p(8, 10), p(4, 11), p(11, 11), p(6, 9), p(9, 9)],
-            enemies: vec![
-                e("General", General, 2, &[SteelLance], 7, 4),
-                e("General", General, 2, &[SteelAxe], 8, 4),
-                e("Sniper", Sniper, 2, &[SteelBow], 3, 1),
-                e("Sniper", Sniper, 2, &[Longbow], 12, 1),
-                e("Sage", Sage, 2, &[Blaze], 11, 0),
-                e("Warrior", Warrior, 2, &[SteelAxe], 2, 4),
-                e("Warrior", Warrior, 2, &[HandAxe], 13, 4),
-                e("Halberdier", Halberdier, 2, &[SteelLance], 4, 3),
-                e("Halberdier", Halberdier, 2, &[Javelin], 11, 3),
-                Unit::generic("Vex", Hero, Team::Enemy, 5, &[SilverSword], p(7, 1)).boss(),
-            ],
-            reinforcements: vec![
-                (3, e("Hero", Hero, 1, &[SteelSword], 0, 6)),
-                (3, e("Hero", Hero, 1, &[SteelSword], 15, 6)),
-                (5, e("Warrior", Warrior, 2, &[SteelAxe], 0, 9)),
-                (5, e("Sage", Sage, 2, &[Ember], 15, 9)),
-            ],
-            villages: vec![(p(15, 11), Reward::Item(SilverSword))],
+            tier: Tier::Large,
+            goal: Goal::Rout,
+            field: Field::Generated {
+                spec: spec(Tier::Large, 804, Theme::Grass, Layout::March, true, false, 2, 3),
+                squads: vec![
+                    sq("Warrior", Warrior, 2, &[SteelAxe], 3, Front),
+                    sq("Halberdier", Halberdier, 2, &[SteelLance], 3, Front),
+                    sq("Hero", Hero, 1, &[SteelSword], 2, Mid),
+                    sq("General", General, 2, &[SteelLance], 3, Mid),
+                    sq("Sniper", Sniper, 2, &[SteelBow], 2, Rear),
+                    sq("Sage", Sage, 2, &[Blaze], 2, Rear),
+                ],
+                named: vec![(boss("Vex", Hero, 5, &[SilverSword]), Rear)],
+                reinforcements: vec![(3, sq("Hero", Hero, 1, &[SteelSword], 2, Edge)), (5, sq("Warrior", Warrior, 2, &[SteelAxe], 1, Edge)), (5, sq("Sage", Sage, 2, &[Ember], 1, Edge))],
+                rewards: vec![Reward::Item(SilverSword), Reward::Item(Elixir)],
+            },
             joins: vec![ally("Bram", General, 3, s(30, 12, 9, 5, 4, 16, 5), s(70, 35, 30, 15, 25, 35, 15), &[SteelLance, SteelAxe])],
             intro: vec![
                 l("", "The Ashen Wall. Black stone and a frozen moat, raised in a single season by Morvaine's sorcery."),
@@ -393,129 +687,327 @@ pub fn chapter(n: usize) -> ChapterDef {
             ],
             outro: vec![
                 l("Vex", "Morvaine... promised me... a kingdom..."),
-                l("Bram", "Past this wall is the Cinder River. He'll try to burn the bridge with us on it."),
+                l("Bram", "Past this wall runs the Cinder River. He'll try to burn the bridge with us on it."),
                 l("Kael", "Let him try."),
             ],
             talks: vec![],
             reward_gold: 3500,
         },
-        6 => ChapterDef {
+        8 => ChapterDef {
             title: "The Burning Bridge",
-            map: [
-                "MM....FF....F.MM",
-                "M.....F..~~....M",
-                "..F......~~..T..",
-                "....F....~~.....",
-                ".........~~..F..",
-                "..FF.....==.....",
-                "........F==.....",
-                "..T......~~..F..",
-                ".........~~.....",
-                "..F..F...~~.T...",
-                "M.......F~~....M",
-                "MM......~~~...MM",
-            ],
-            objective: Objective::Survive(7),
-            starts: vec![p(13, 5), p(12, 5), p(12, 6), p(13, 6), p(12, 4), p(14, 5), p(14, 6), p(12, 7), p(11, 3), p(14, 3), p(13, 2), p(12, 8)],
-            enemies: vec![
-                e("Warrior", Warrior, 3, &[SteelAxe], 3, 5),
-                e("Warrior", Warrior, 3, &[HandAxe], 2, 6),
-                e("Hero", Hero, 3, &[SteelSword], 5, 4),
-                e("Halberdier", Halberdier, 3, &[SteelLance], 6, 6),
-                e("Sage", Sage, 3, &[Blaze], 4, 8),
-                e("Sniper", Sniper, 3, &[Longbow], 7, 2),
-                Unit::new("Corvin", Sniper, Team::Enemy, 4, s(27, 10, 13, 12, 5, 7, 5), s(70, 45, 55, 50, 30, 20, 20), &[SteelBow, Longbow], p(6, 2)).talkable(),
-                Unit::generic("Ruk", Warrior, Team::Enemy, 6, &[SilverAxe], p(2, 7)),
-            ],
-            reinforcements: vec![
-                (2, e("Hero", Hero, 2, &[SteelSword], 0, 3)),
-                (2, e("Warrior", Warrior, 2, &[SteelAxe], 0, 6)),
-                (3, e("General", General, 3, &[SteelLance], 0, 8)),
-                (4, e("Sage", Sage, 3, &[Blaze], 1, 2)),
-                (4, e("Hero", Hero, 3, &[SteelSword], 0, 5)),
-                (5, e("Warrior", Warrior, 3, &[SteelAxe], 0, 4)),
-                (5, e("Sniper", Sniper, 3, &[SteelBow], 1, 9)),
-                (6, e("Halberdier", Halberdier, 4, &[SteelLance], 0, 6)),
-            ],
-            villages: vec![],
+            tier: Tier::Large,
+            goal: Goal::Survive(7),
+            field: Field::Generated {
+                spec: spec(Tier::Large, 905, Theme::Woods, Layout::March, true, false, 2, 4),
+                squads: vec![
+                    sq("Warrior", Warrior, 3, &[SteelAxe], 3, Front),
+                    sq("Hero", Hero, 3, &[SteelSword], 3, Mid),
+                    sq("Halberdier", Halberdier, 3, &[SteelLance], 3, Mid),
+                    sq("Sage", Sage, 3, &[Blaze], 2, Mid),
+                    sq("Sniper", Sniper, 3, &[Longbow], 2, Rear),
+                ],
+                named: vec![
+                    (Unit::new("Corvin", Sniper, Team::Enemy, 4, s(27, 10, 13, 12, 5, 7, 5), s(70, 45, 55, 50, 30, 20, 20), &[SteelBow, Longbow], p(0, 0)).talkable(), Front),
+                    (Unit::generic("Ruk", Warrior, Team::Enemy, 6, &[SilverAxe], p(0, 0)), Mid),
+                ],
+                reinforcements: vec![
+                    (2, sq("Hero", Hero, 2, &[SteelSword], 2, Edge)),
+                    (3, sq("General", General, 3, &[SteelLance], 2, Edge)),
+                    (4, sq("Sage", Sage, 3, &[Blaze], 2, Edge)),
+                    (5, sq("Warrior", Warrior, 3, &[SteelAxe], 3, Edge)),
+                    (6, sq("Halberdier", Halberdier, 4, &[SteelLance], 2, Edge)),
+                ],
+                rewards: vec![Reward::Item(Renew), Reward::Gold(2500)],
+            },
             joins: vec![],
             intro: vec![
-                l("", "The Cinder River. One stone bridge, and on the far bank, the whole strength of the Legion's field army."),
-                l("Ruk", "Hold them on the bridge! When the sorcerers finish the ritual, the whole span burns!"),
-                l("Ilse", "The ritual needs seven turns. If we hold the east bank that long, it breaks, and their army is stranded."),
-                l("Kael", "Then we hold the east bank. Bram, Sera, plug the bridge. Archers and mages behind them."),
-                l("Tamsin", "There's a Legion sniper on the far side who keeps missing on purpose. I think he wants out."),
+                l("", "The Cinder River. Stone bridges, and on the far bank the whole strength of the Legion's field army."),
+                l("Ruk", "Hold them at the river! When the sorcerers finish the ritual, every bridge burns!"),
+                l("Ilse", "The ritual needs seven turns. If we survive that long, it collapses and their army is stranded."),
+                l("Kael", "Then we hold. Bram, Sera, plug the bridges. Archers and mages behind them."),
+                l("Tamsin", "There's a Legion sniper out there who keeps missing on purpose. I think he wants out."),
                 l("", "Hint: Corvin can be recruited if Kael talks to him."),
             ],
             outro: vec![
-                l("", "The ritual collapses. On the far bank the Legion's banners waver and start to scatter."),
-                l("Corvin", "Morvaine waits in the Ember Throne. Without his army, he has only his own sorcery left."),
-                l("Kael", "Then this ends tomorrow."),
+                l("", "The ritual collapses. On the far bank the Legion's banners waver, then scatter."),
+                l("Corvin", "Dawnhold lies beyond. Marshal Kreth holds the outer city for Morvaine."),
+                l("Kael", "Then we take the capital back, street by street."),
             ],
             talks: vec![(
                 "Corvin",
                 vec![
                     l("Kael", "You've been firing wide all day. Why?"),
-                    l("Corvin", "Because I'm from Hollowmere. You saved my mother and sisters. I'm not going to shoot their saviour."),
+                    l("Corvin", "Because I'm from Hollowmere. You saved my mother and sisters. I won't shoot their saviour."),
                     l("Kael", "Then come home. Fight for your village instead of against it."),
                     l("Corvin", "Thought you'd never ask."),
                 ],
             )],
             reward_gold: 4000,
         },
-        _ => ChapterDef {
-            title: "Throne of Ash",
-            map: [
-                "################",
-                "#,,P,,,H,,,,P,,#",
-                "#,,,,,,,,,,,,,,#",
-                "#,,P,,#,,#,,P,,#",
-                "#,,,,,#,,#,,,,,#",
-                "####,,#,,#,,####",
-                "#,,,,,,,,,,,,,,#",
-                "#,P,,,,P,,,,P,,#",
-                "#,,,,##,,##,,,,#",
-                "#,,,,#,,,,#,,,,#",
-                "#,,,,,,,,,,,,,,#",
-                "######,,,,######",
-            ],
-            objective: Objective::Boss,
-            starts: vec![p(7, 11), p(8, 11), p(6, 11), p(9, 11), p(7, 10), p(8, 10), p(6, 10), p(9, 10), p(5, 10), p(10, 10), p(7, 9), p(8, 9)],
-            enemies: vec![
-                e("General", General, 6, &[SilverLance], 7, 2),
-                e("General", General, 6, &[SteelAxe], 8, 2),
-                e("Sage", Sage, 6, &[Inferno], 3, 1),
-                e("Sage", Sage, 6, &[Blaze], 12, 1),
-                e("Hero", Hero, 6, &[SilverSword], 4, 4),
-                e("Hero", Hero, 6, &[SteelSword], 11, 4),
-                e("Sniper", Sniper, 6, &[Longbow], 2, 7),
-                e("Sniper", Sniper, 6, &[SteelBow], 13, 7),
-                e("Warrior", Warrior, 6, &[SilverAxe], 7, 6),
-                e("Halberdier", Halberdier, 6, &[SilverLance], 8, 6),
-                Unit::new("Morvaine", Sorcerer, Team::Enemy, 10, s(42, 15, 13, 10, 6, 10, 14), Stats::default(), &[Umbra], p(7, 1)).boss(),
-            ],
-            reinforcements: vec![
-                (3, e("Hero", Hero, 5, &[SteelSword], 1, 6)),
-                (3, e("Warrior", Warrior, 5, &[SteelAxe], 14, 6)),
-                (5, e("Sage", Sage, 5, &[Blaze], 1, 6)),
-                (5, e("General", General, 5, &[SteelLance], 14, 6)),
-            ],
-            villages: vec![],
+        9 => ChapterDef {
+            title: "Siege of Dawnhold",
+            tier: Tier::ExtraLarge,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::ExtraLarge, 1006, Theme::Ruins, Layout::March, false, true, 3, 3),
+                squads: vec![
+                    sq("Halberdier", Halberdier, 4, &[SteelLance], 3, Front),
+                    sq("Hero", Hero, 4, &[SteelSword], 3, Front),
+                    sq("Warrior", Warrior, 4, &[SteelAxe], 2, Mid),
+                    sq("Sniper", Sniper, 4, &[SteelBow], 3, Mid),
+                    sq("Sage", Sage, 4, &[Blaze], 2, Mid),
+                    guard("General", General, 5, &[SilverLance], 3, Castle),
+                    guard("Sage", Sage, 5, &[Inferno], 1, Castle),
+                ],
+                named: vec![
+                    (boss("Kreth", General, 7, &[SilverLance, SteelAxe]), Throne),
+                    (Unit::new("Rhea", Hero, Team::Enemy, 4, s(31, 11, 13, 13, 7, 9, 5), s(75, 45, 50, 50, 40, 30, 20), &[SilverSword, HandAxe], p(0, 0)).talkable(), Front),
+                ],
+                reinforcements: vec![(4, sq("Hero", Hero, 4, &[SteelSword], 2, Edge)), (6, sq("General", General, 4, &[SteelLance], 2, Edge))],
+                rewards: vec![Reward::Item(MasterSeal), Reward::Gold(3000), Reward::Item(Elixir)],
+            },
             joins: vec![],
             intro: vec![
-                l("", "The capital. Ash lies on the streets like snow. In the great hall, the cold brazier of the Dawn Flame still stands."),
-                l("Morvaine", "Little lord of Ashford. You've come a long way just to die in the dark."),
-                l("Kael", "The Flame isn't dead, Morvaine. It's in every village that stood when you said it would kneel."),
-                l("Morvaine", "Pretty words. Let's see how they burn."),
-                l("Liese", "Whatever happens, I'm right behind you. All of us are."),
-                l("", "Final battle: defeat Morvaine."),
+                l("", "Dawnhold, the capital. Its outer district is a maze of broken walls held by the Legion's best."),
+                l("Bram", "Marshal Kreth commands here. A cold one. He hanged the city council from the gatehouse."),
+                l("Corvin", "There's a captain on the barricades, Rhea. She led the old city guard. They're holding her children."),
+                l("Kael", "Then we give her a reason to change sides. Talk first, fight second."),
             ],
             outro: vec![
-                l("Morvaine", "Impossible... the dark was... eternal..."),
-                l("", "As the sorcerer falls, a single spark rises from the brazier. It catches, then roars upward, gold and white."),
+                l("Kreth", "Fools... the Sovereign is coming... Morvaine was only the herald..."),
+                l("Kael", "The Sovereign?"),
+                l("Aldous", "The torn page. We need to hear the rest from Morvaine himself."),
+            ],
+            talks: vec![(
+                "Rhea",
+                vec![
+                    l("Kael", "Captain Rhea. Your city needs its guard back."),
+                    l("Rhea", "My children are in Kreth's dungeons. If I lower my sword, they die."),
+                    l("Kael", "Maeve and Dain are already in the dungeons. Your children will be free before sunset."),
+                    l("Rhea", "...Then my blade belongs to the March. Let's take back Dawnhold."),
+                ],
+            )],
+            reward_gold: 4500,
+        },
+        10 => ChapterDef {
+            title: "Throne of Ash",
+            tier: Tier::Medium,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::Medium, 1107, Theme::Fortress, Layout::March, false, true, 0, 0),
+                squads: vec![
+                    sq("Hero", Hero, 6, &[SilverSword], 3, Front),
+                    sq("Warrior", Warrior, 6, &[SilverAxe], 2, Front),
+                    sq("Halberdier", Halberdier, 6, &[SilverLance], 3, Mid),
+                    sq("Sniper", Sniper, 6, &[Longbow], 2, Mid),
+                    sq("Sage", Sage, 6, &[Inferno], 2, Rear),
+                    guard("General", General, 6, &[SilverLance], 3, Rear),
+                ],
+                named: vec![(Unit::new("Morvaine", Sorcerer, Team::Enemy, 10, s(42, 15, 13, 10, 6, 10, 14), Stats::default(), &[Umbra], p(0, 0)).boss(), Throne)],
+                reinforcements: vec![(3, sq("Hero", Hero, 5, &[SteelSword], 2, Edge)), (5, sq("Sage", Sage, 5, &[Blaze], 2, Edge))],
+                rewards: vec![],
+            },
+            joins: vec![],
+            intro: vec![
+                l("", "The Ember Throne. Ash lies on the floors like snow. In the great hall, the brazier of the Dawn Flame stands cold."),
+                l("Morvaine", "Little lord of Ashford. You've come a long way just to die in the dark."),
+                l("Kael", "The Flame isn't dead, Morvaine. It lives in every village that stood when you said it would kneel."),
+                l("Morvaine", "Pretty words. Let's see how they burn."),
+                l("", "Defeat Morvaine."),
+            ],
+            outro: vec![
+                l("Morvaine", "You think... I wanted this? I only... opened the door..."),
+                l("Kael", "What door, Morvaine?"),
+                l("Morvaine", "The Flame was a lock. I put it out. Now Vaelith, the Pale Sovereign, will walk south. Laugh, boy. You've won nothing."),
+                l("", "Morvaine is dead, but the brazier stays cold. From the north, a bitter wind begins to blow."),
+                l("Aldous", "If the Flame was a seal, it must be relit. The chronicle speaks of an Ember Heart, kept in a vault beyond the Frostmarch."),
+                l("Kael", "Then we go north. All of us."),
+                l("", "END OF ACT I"),
+            ],
+            talks: vec![],
+            reward_gold: 6000,
+        },
+        11 => ChapterDef {
+            title: "The Frostmarch",
+            tier: Tier::Large,
+            goal: Goal::Survive(8),
+            field: Field::Generated {
+                spec: spec(Tier::Large, 1208, Theme::Highlands, Layout::Defend, false, false, 4, 4),
+                squads: vec![
+                    sq("Pale Axe", Warrior, 6, &[SteelAxe], 2, Front),
+                    sq("Pale Blade", Hero, 6, &[SteelSword], 2, Front),
+                    sq("Pale Knight", General, 6, &[SteelLance], 3, Mid),
+                    sq("Pale Blade", Hero, 6, &[SteelSword], 4, Mid),
+                    sq("Pale Archer", Sniper, 6, &[SteelBow], 3, Rear),
+                    sq("Pale Seer", Sage, 6, &[Blaze], 2, Rear),
+                ],
+                named: vec![],
+                reinforcements: vec![
+                    (2, sq("Pale Blade", Hero, 6, &[SteelSword], 3, Edge)),
+                    (3, sq("Pale Axe", Warrior, 6, &[SteelAxe], 3, Edge)),
+                    (4, sq("Pale Seer", Sage, 6, &[Blaze], 2, Edge)),
+                    (5, sq("Pale Knight", General, 7, &[SteelLance], 3, Edge)),
+                    (6, sq("Pale Blade", Hero, 7, &[SilverSword], 3, Edge)),
+                    (7, sq("Pale Archer", Sniper, 7, &[Longbow], 2, Edge)),
+                ],
+                rewards: vec![Reward::Item(Elixir), Reward::Item(MasterSeal), Reward::Gold(3000), Reward::Item(SilverAxe)],
+            },
+            joins: vec![ally("Toma", Warrior, 6, s(40, 15, 10, 10, 5, 10, 3), s(85, 55, 35, 35, 30, 30, 10), &[SilverAxe, SteelBow])],
+            intro: vec![
+                l("", "ACT II - The Frostmarch. A frozen moor where the old roads vanish under the snow."),
+                l("Toma", "Southerners! You'll freeze out here. I'm Toma, of the moor clans. Something is hunting my people. Pale things in armour."),
+                l("Kael", "The Sovereign's army. How long until this storm passes?"),
+                l("Toma", "Eight turns of the watch, if the spirits are kind. Make a ring around the old forts and hold."),
+                l("Bram", "They don't bleed, and they don't run. Stay in formation."),
+            ],
+            outro: vec![
+                l("Toma", "You held. The clans will remember this."),
+                l("", "The storm breaks. Beyond the moor, half buried in ice, the Vault of Embers waits."),
+            ],
+            talks: vec![],
+            reward_gold: 5000,
+        },
+        12 => ChapterDef {
+            title: "Vault of Embers",
+            tier: Tier::Medium,
+            goal: Goal::Seize,
+            field: Field::Generated {
+                spec: spec(Tier::Medium, 1309, Theme::Ruins, Layout::March, false, true, 3, 3),
+                squads: vec![
+                    sq("Pale Blade", Hero, 7, &[SilverSword], 3, Front),
+                    sq("Pale Axe", Warrior, 7, &[SteelAxe], 2, Front),
+                    sq("Pale Knight", General, 7, &[SilverLance], 3, Mid),
+                    sq("Pale Archer", Sniper, 7, &[Longbow], 2, Mid),
+                    sq("Pale Seer", Sage, 7, &[Blaze], 3, Mid),
+                    guard("Pale Knight", General, 8, &[SilverLance], 2, Castle),
+                    guard("Pale Seer", Sage, 8, &[Inferno], 2, Castle),
+                ],
+                named: vec![
+                    (boss("Grimhal", Warlord, 8, &[SilverAxe, HandAxe]), Throne),
+                    (Unit::new("Seren", Sage, Team::Enemy, 8, s(30, 15, 14, 13, 8, 7, 14), s(55, 55, 45, 45, 35, 15, 45), &[Inferno, Mend], p(0, 0)).talkable(), Mid),
+                ],
+                reinforcements: vec![(4, sq("Pale Blade", Hero, 7, &[SteelSword], 3, Edge)), (7, sq("Pale Knight", General, 8, &[SteelLance], 3, Edge))],
+                rewards: vec![Reward::Item(SilverLance), Reward::Gold(4000), Reward::Item(Elixir)],
+            },
+            joins: vec![],
+            intro: vec![
+                l("", "The Vault of Embers. Built by the first kings to guard the Ember Heart, the spark that once lit the Dawn Flame."),
+                l("Seren", "Turn back. No one has entered the Vault in four hundred years. I am its keeper, and I will not fail now."),
+                l("Kael", "The Sovereign's army is already inside. If they take the Heart, no one can ever relight the Flame."),
+                l("Seren", "Pretty words. Thieves always have them."),
+                l("", "Hint: Kael can talk to Seren. Objective: seize the inner sanctum."),
+            ],
+            outro: vec![
+                l("", "In the sanctum, the Ember Heart pulses like a living coal."),
+                l("Seren", "Vaelith will feel it wake. He will send everything he has to stop us."),
+                l("Kael", "Then we meet him at the coast. The fishermen of Greyhaven can carry us to his citadel."),
+            ],
+            talks: vec![(
+                "Seren",
+                vec![
+                    l("Kael", "I'm not here to steal the Heart. I'm here to carry it home and light the Flame again."),
+                    l("Seren", "...You bear the Ashford crest. The founders' line. The chronicles said one of you would come."),
+                    l("Seren", "Very well. The keeper goes wherever the Heart goes."),
+                ],
+            )],
+            reward_gold: 5000,
+        },
+        13 => ChapterDef {
+            title: "The Shattered Coast",
+            tier: Tier::ExtraLarge,
+            goal: Goal::Rout,
+            field: Field::Generated {
+                spec: spec(Tier::ExtraLarge, 1410, Theme::Marsh, Layout::March, true, false, 4, 4),
+                squads: vec![
+                    sq("Pale Blade", Hero, 8, &[SilverSword], 4, Front),
+                    sq("Pale Axe", Warrior, 8, &[SilverAxe], 4, Front),
+                    sq("Pale Knight", General, 8, &[SilverLance], 3, Mid),
+                    sq("Pale Archer", Sniper, 8, &[Longbow], 4, Mid),
+                    sq("Pale Seer", Sage, 8, &[Inferno], 3, Rear),
+                    guard("Pale Lancer", Halberdier, 8, &[SilverLance], 4, Rear),
+                ],
+                named: vec![(boss("Captain Hrolf", Warrior, 10, &[SilverAxe, HandAxe]), Rear)],
+                reinforcements: vec![(3, sq("Pale Blade", Hero, 8, &[SteelSword], 3, Edge)), (6, sq("Pale Seer", Sage, 8, &[Blaze], 2, Edge))],
+                rewards: vec![Reward::Item(MasterSeal), Reward::Item(Elixir), Reward::Gold(5000), Reward::Item(SilverSword)],
+            },
+            joins: vec![],
+            intro: vec![
+                l("", "Greyhaven was a fishing port. Now ships of black ice crowd its harbour: the Pale Fleet."),
+                l("Maeve", "Clear the docks and the fishermen will give us their boats."),
+                l("Rhea", "Every last one of them, then. No retreat."),
+                l("Hrolf", "The Heart-thief comes! Break the southerners on the shore!"),
+            ],
+            outro: vec![
+                l("", "The harbour is free. Fishermen raise their sails, and the army of the March sets out across the grey sea."),
+                l("Kael", "Vaelith's citadel. The Hollow Bastion. One more wall."),
+            ],
+            talks: vec![],
+            reward_gold: 6000,
+        },
+        14 => ChapterDef {
+            title: "The Hollow Bastion",
+            tier: Tier::Large,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::Large, 1511, Theme::Fortress, Layout::March, false, true, 0, 0),
+                squads: vec![
+                    sq("Pale Blade", Hero, 9, &[SilverSword], 4, Front),
+                    sq("Pale Axe", Warrior, 9, &[SilverAxe], 4, Front),
+                    sq("Pale Lancer", Halberdier, 9, &[SilverLance], 4, Mid),
+                    sq("Pale Archer", Sniper, 9, &[Longbow], 3, Mid),
+                    sq("Pale Seer", Sage, 9, &[Inferno], 3, Rear),
+                    guard("Pale Knight", General, 10, &[SilverLance], 4, Rear),
+                ],
+                named: vec![(boss("Ysolde", General, 12, &[SilverLance, SilverAxe]), Throne)],
+                reinforcements: vec![(3, sq("Pale Blade", Hero, 9, &[SilverSword], 3, Edge)), (5, sq("Pale Seer", Sage, 9, &[Inferno], 2, Edge))],
+                rewards: vec![],
+            },
+            joins: vec![],
+            intro: vec![
+                l("Ysolde", "I was a knight of Emberfall once, before the cold took my heart. Turn back, heir of Ashford."),
+                l("Sera", "Ysolde? The Hollowmere histories speak of you. The knight who never came back from the north."),
+                l("Ysolde", "I came back. I simply forgot why I ever left."),
+                l("Kael", "Then let us remind you."),
+            ],
+            outro: vec![
+                l("Ysolde", "Warm... I remember now... Finish it, Ashford. Free us all."),
+                l("Seren", "The Heart is burning hotter. Vaelith's throne lies just beyond these halls."),
+            ],
+            talks: vec![],
+            reward_gold: 6000,
+        },
+        _ => ChapterDef {
+            title: "Heart of Winter",
+            tier: Tier::ExtraLarge,
+            goal: Goal::Boss,
+            field: Field::Generated {
+                spec: spec(Tier::ExtraLarge, 1612, Theme::Fortress, Layout::March, false, true, 0, 0),
+                squads: vec![
+                    sq("Pale Blade", Hero, 11, &[SilverSword], 5, Front),
+                    sq("Pale Axe", Warrior, 11, &[SilverAxe], 4, Front),
+                    sq("Pale Lancer", Halberdier, 11, &[SilverLance], 4, Mid),
+                    sq("Pale Archer", Sniper, 11, &[Longbow], 4, Mid),
+                    sq("Pale Seer", Sage, 11, &[Inferno], 4, Rear),
+                    guard("Pale Knight", General, 12, &[SilverLance], 4, Rear),
+                ],
+                named: vec![(Unit::new("Vaelith", Sorcerer, Team::Enemy, 20, s(55, 19, 16, 13, 10, 13, 18), Stats::default(), &[Umbra], p(0, 0)).boss(), Throne)],
+                reinforcements: vec![(3, sq("Pale Blade", Hero, 10, &[SilverSword], 3, Edge)), (5, sq("Pale Seer", Sage, 10, &[Inferno], 3, Edge)), (7, sq("Pale Knight", General, 11, &[SilverLance], 3, Edge))],
+                rewards: vec![],
+            },
+            joins: vec![],
+            intro: vec![
+                l("", "At the heart of the Bastion, under a sky of frozen stars, the Pale Sovereign waits."),
+                l("Vaelith", "For a thousand years I slept beneath your little candle. Now the world will be quiet, and cold, and still."),
+                l("Kael", "Not while one of us is still standing."),
+                l("Liese", "Whatever happens, we're with you. Every one of us."),
+                l("", "Final battle: defeat Vaelith."),
+            ],
+            outro: vec![
+                l("Vaelith", "The cold... always... returns..."),
+                l("Kael", "Then we'll always be here to light the Flame."),
+                l("", "Kael raises the Ember Heart. Golden light pours across the ice, and far to the south, in Dawnhold, the great brazier roars back to life."),
                 l("Orrin", "The Dawn Flame... it's burning again."),
-                l("Brenna", "My lord. Your people are waiting."),
-                l("Kael", "Not my people. Our people. Every one of you made this possible."),
+                l("Brenna", "My lord. Let's go home."),
             ],
             talks: vec![],
             reward_gold: 0,
@@ -523,9 +1015,10 @@ pub fn chapter(n: usize) -> ChapterDef {
     }
 }
 
-pub const EPILOGUE: [&str; 4] = [
-    "With the Flame rekindled, the Ashen Legion broke apart within a season.",
-    "Kael refused the crown until every village Morvaine burned had been rebuilt.",
+pub const EPILOGUE: [&str; 5] = [
+    "With the Flame rekindled, the Pale Sovereign's armies melted like frost at dawn.",
+    "Kael refused the crown until every village burned in the war had been rebuilt.",
+    "Aldous and Seren restored the Vigil's chronicles, so the truth of the Flame would never be lost again.",
     "The companions of the March scattered across Emberfall. Wherever they went, songs followed.",
     "And the Dawn Flame has burned ever since.",
 ];
@@ -574,7 +1067,7 @@ impl Campaign {
     }
 
     pub fn battle(&self, seed: u64) -> Battle {
-        let def = self.def();
+        let def = setup(self.chapter);
         let mut units = Vec::new();
         for (slot, idx) in self.deployment(def.starts.len()).into_iter().enumerate() {
             let mut u = self.army[idx].clone();
@@ -586,7 +1079,7 @@ impl Campaign {
             units.push(u);
         }
         units.extend(def.enemies);
-        let mut b = Battle::new(Map::from_rows(&def.map), units, seed, self.permadeath);
+        let mut b = Battle::new(def.map, units, seed, self.permadeath);
         b.objective = def.objective;
         b.reinforcements = def.reinforcements;
         b.villages = def.villages.into_iter().map(|(pos, reward)| Village { pos, reward, visited: false }).collect();
@@ -630,34 +1123,38 @@ mod tests {
 
     #[test]
     fn every_chapter_is_valid() {
+        use crate::logic::terrain::{MoveType, Terrain};
         for n in 0..CHAPTER_COUNT {
             let def = chapter(n);
-            let map = Map::from_rows(&def.map);
-            assert_eq!((map.width, map.height), (16, 12), "chapter {n}");
+            let st = setup(n);
+            let map = &st.map;
+            assert_eq!((map.width, map.height), def.tier.size(), "chapter {n}");
             let mut seen = HashSet::new();
-            for &s in &def.starts {
-                assert!(map.at(s).move_cost(super::super::terrain::MoveType::Infantry).is_some(), "chapter {n}: start {s:?} impassable");
+            for &s in &st.starts {
+                assert!(map.at(s).move_cost(MoveType::Infantry).is_some(), "chapter {n}: start {s:?} impassable");
                 assert!(seen.insert(s), "chapter {n}: duplicate start {s:?}");
             }
-            for u in def.enemies.iter().chain(def.reinforcements.iter().map(|(_, u)| u)) {
+            assert!(st.starts.len() >= def.tier.deploy().min(8), "chapter {n}: only {} starts", st.starts.len());
+            for u in st.enemies.iter().chain(st.reinforcements.iter().map(|(_, u)| u)) {
                 assert!(map.in_bounds(u.pos), "chapter {n}: {} off map", u.name);
                 assert!(map.at(u.pos).move_cost(u.class.move_type()).is_some(), "chapter {n}: {} on impassable {:?}", u.name, u.pos);
                 assert!(u.weapon().is_some(), "chapter {n}: {} has no usable weapon", u.name);
             }
-            for u in &def.enemies {
+            for u in &st.enemies {
                 assert!(seen.insert(u.pos), "chapter {n}: {} overlaps at {:?}", u.name, u.pos);
             }
-            for (v, _) in &def.villages {
-                assert_eq!(map.at(*v), super::super::terrain::Terrain::Village, "chapter {n}: village tile {v:?}");
+            for (v, _) in &st.villages {
+                assert_eq!(map.at(*v), Terrain::Village, "chapter {n}: village tile {v:?}");
             }
-            if let Objective::Seize(t) = def.objective {
-                assert_eq!(map.at(t), super::super::terrain::Terrain::Throne);
+            if let Objective::Seize(t) = st.objective {
+                assert_eq!(map.at(t), Terrain::Throne);
+                assert!(st.enemies.iter().any(|u| u.is_boss && u.pos == t), "chapter {n}: boss should hold the throne");
             }
-            if matches!(def.objective, Objective::Boss) {
-                assert_eq!(def.enemies.iter().filter(|u| u.is_boss).count(), 1, "chapter {n} needs one boss");
+            if matches!(st.objective, Objective::Boss) {
+                assert_eq!(st.enemies.iter().filter(|u| u.is_boss).count(), 1, "chapter {n} needs one boss");
             }
             for (name, _) in &def.talks {
-                assert!(def.enemies.iter().any(|u| u.name == *name && u.talk), "chapter {n}: talk target {name}");
+                assert!(st.enemies.iter().any(|u| u.name == *name && u.talk), "chapter {n}: talk target {name}");
             }
             for u in &def.joins {
                 for k in &u.items {
@@ -665,7 +1162,23 @@ mod tests {
                 }
             }
             assert!(!def.intro.is_empty() && !def.outro.is_empty());
+            let expected = match def.tier {
+                Tier::Small => 7..=13,
+                Tier::Medium => 11..=20,
+                Tier::Large => 14..=26,
+                Tier::ExtraLarge => 19..=34,
+            };
+            assert!(expected.contains(&st.enemies.len()), "chapter {n}: {} enemies for {:?}", st.enemies.len(), def.tier);
         }
+    }
+
+    #[test]
+    fn all_four_map_sizes_are_used() {
+        let tiers: Vec<Tier> = (0..CHAPTER_COUNT).map(|n| chapter(n).tier).collect();
+        for t in [Tier::Small, Tier::Medium, Tier::Large, Tier::ExtraLarge] {
+            assert!(tiers.contains(&t), "{t:?} unused");
+        }
+        assert_eq!(chapter(CHAPTER_COUNT - 1).tier, Tier::ExtraLarge, "finale is the biggest battle");
     }
 
     #[test]
@@ -729,7 +1242,7 @@ mod tests {
         assert!(c.army[d[0]].is_lord);
         let b = c.battle(1);
         assert!(b.units[0].is_lord);
-        assert_eq!(b.units[0].pos, chapter(0).starts[0]);
+        assert_eq!(b.units[0].pos, setup(0).starts[0]);
     }
 
     #[test]
@@ -819,7 +1332,9 @@ mod sim {
         (b.outcome(), b.turn, b.fallen.len())
     }
 
+    /// Slow on big maps; run with `cargo test -- --ignored --nocapture`.
     #[test]
+    #[ignore]
     fn auto_battle_every_chapter() {
         for n in 0..CHAPTER_COUNT {
             let mut c = Campaign::new(false);

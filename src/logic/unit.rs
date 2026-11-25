@@ -5,7 +5,7 @@ use super::rng::Rng;
 use super::terrain::MoveType;
 use super::Pos;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Team {
     Player,
     Enemy,
@@ -17,7 +17,7 @@ impl Team {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WeaponKind {
     Sword,
     Lance,
@@ -85,7 +85,7 @@ impl Weapon {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Class {
     // Base classes
     Lord,

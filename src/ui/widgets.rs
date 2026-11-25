@@ -4,15 +4,26 @@ use macroquad::prelude::*;
 
 use super::gfx::rgb;
 
-/// One tap (touch start or left click) per frame, consumed by the first
-/// widget that claims it.
+/// One tap per frame (a press and release without dragging), plus drag
+/// movement for panning. The first widget that claims the tap consumes it.
 pub struct Input {
     tap: Option<Vec2>,
+    /// (where the drag started, movement this frame)
+    pub drag: Option<(Vec2, Vec2)>,
+}
+
+#[derive(Default)]
+struct Pointer {
+    down: bool,
+    start: Vec2,
+    last: Vec2,
+    dragging: bool,
 }
 
 thread_local! {
     static INJECTED: std::cell::Cell<Option<Vec2>> = const { std::cell::Cell::new(None) };
     static SCRIPTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static POINTER: std::cell::RefCell<Pointer> = std::cell::RefCell::new(Pointer::default());
 }
 
 /// Queue a synthetic tap for the next frame (used by the desktop debug script).
@@ -24,17 +35,52 @@ pub fn inject_tap(p: Vec2) {
 impl Input {
     pub fn poll() -> Input {
         if let Some(p) = INJECTED.with(|c| c.take()) {
-            return Input { tap: Some(p) };
+            return Input { tap: Some(p), drag: None };
         }
         if SCRIPTED.with(|c| c.get()) {
-            return Input { tap: None };
+            return Input { tap: None, drag: None };
         }
-        let mut tap = touches().into_iter().find(|t| t.phase == TouchPhase::Started).map(|t| t.position);
-        if tap.is_none() && is_mouse_button_pressed(MouseButton::Left) {
-            let (x, y) = mouse_position();
-            tap = Some(vec2(x, y));
-        }
-        Input { tap }
+        let (pressed, held, released, pos) = match touches().first() {
+            Some(t) => (
+                t.phase == TouchPhase::Started,
+                matches!(t.phase, TouchPhase::Moved | TouchPhase::Stationary),
+                matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled),
+                t.position,
+            ),
+            None => {
+                let (x, y) = mouse_position();
+                (
+                    is_mouse_button_pressed(MouseButton::Left),
+                    is_mouse_button_down(MouseButton::Left),
+                    is_mouse_button_released(MouseButton::Left),
+                    vec2(x, y),
+                )
+            }
+        };
+        let threshold = screen_width().min(screen_height()) * 0.025;
+        POINTER.with(|ptr| {
+            let mut ptr = ptr.borrow_mut();
+            let mut out = Input { tap: None, drag: None };
+            if pressed {
+                *ptr = Pointer { down: true, start: pos, last: pos, dragging: false };
+            }
+            if ptr.down && (held || pressed) {
+                if (pos - ptr.start).length() > threshold {
+                    ptr.dragging = true;
+                }
+                if ptr.dragging {
+                    out.drag = Some((ptr.start, pos - ptr.last));
+                }
+                ptr.last = pos;
+            }
+            if released && ptr.down {
+                if !ptr.dragging {
+                    out.tap = Some(ptr.start);
+                }
+                ptr.down = false;
+            }
+            out
+        })
     }
 
     pub fn tapped_in(&mut self, r: Rect) -> bool {
@@ -52,59 +98,113 @@ impl Input {
     }
 }
 
+/// Battle screen layout: a scrollable map viewport plus the side panel.
 #[derive(Clone, Copy, Debug)]
 pub struct Layout {
+    /// Top-left of the map viewport on screen.
     pub ox: f32,
     pub oy: f32,
     pub tile: f32,
+    /// Viewport size in pixels.
     pub map_w: f32,
     pub map_h: f32,
     pub panel: Rect,
     /// Base UI unit (font size); scales with screen.
     pub u: f32,
+    /// Camera: map tile coordinate at the viewport's top-left.
+    pub cam: Vec2,
+    pub cols: i32,
+    pub rows: i32,
 }
 
+pub const ZOOM_LEVELS: usize = 3;
+
 impl Layout {
-    pub fn compute(map_tiles_w: i32, map_tiles_h: i32) -> Layout {
+    /// `zoom` 0 = whole map, 1 = ~12 rows, 2 = ~8 rows.
+    pub fn compute(cols: i32, rows: i32, zoom: usize, cam: Vec2) -> Layout {
         let (w, h) = (screen_width(), screen_height());
-        let mw = map_tiles_w as f32;
-        let mh = map_tiles_h as f32;
+        let mw = cols as f32;
+        let mh = rows as f32;
         let u = (w.min(h) / 26.0).clamp(14.0, 48.0);
-        let margin = (u * 0.3).floor();
-        if w >= h * 1.05 {
+        let m = (u * 0.3).floor();
+        let landscape = w >= h * 1.05;
+        let area = if landscape {
             let panel_min = (w * 0.26).max(u * 11.0).min(w * 0.45);
-            let tile = ((w - panel_min - margin * 2.0) / mw).min((h - margin * 2.0) / mh).floor().max(8.0);
-            let map_w = tile * mw;
-            let map_h = tile * mh;
-            let ox = margin;
-            let oy = ((h - map_h) / 2.0).floor();
-            let px = ox + map_w + margin;
-            Layout { ox, oy, tile, map_w, map_h, panel: Rect::new(px, margin, w - px - margin, h - margin * 2.0), u }
+            Rect::new(m, m, w - panel_min - m * 3.0, h - m * 2.0)
         } else {
-            let tile = ((w - margin * 2.0) / mw).min(h * 0.62 / mh).floor().max(8.0);
-            let map_w = tile * mw;
-            let map_h = tile * mh;
-            let ox = ((w - map_w) / 2.0).floor();
-            let oy = margin;
-            let py = oy + map_h + margin;
-            Layout { ox, oy, tile, map_w, map_h, panel: Rect::new(margin, py, w - margin * 2.0, h - py - margin), u }
-        }
+            Rect::new(m, m, w - m * 2.0, h * 0.62)
+        };
+        let fit = (area.w / mw).min(area.h / mh).floor().max(6.0);
+        let vis_rows = [mh, 12.0, 8.0][zoom.min(ZOOM_LEVELS - 1)];
+        let tile = if zoom == 0 { fit } else { (area.h / vis_rows).max(fit).floor() };
+        let map_w = (mw * tile).min(area.w);
+        let map_h = (mh * tile).min(area.h);
+        let ox = if landscape { area.x } else { area.x + (area.w - map_w) / 2.0 };
+        let oy = if landscape { area.y + (area.h - map_h) / 2.0 } else { area.y };
+        let max_cam = vec2((mw - map_w / tile).max(0.0), (mh - map_h / tile).max(0.0));
+        // Snap to whole pixels so tile edges land exactly.
+        let cam = (cam.clamp(Vec2::ZERO, max_cam) * tile).round() / tile;
+        let panel = if landscape {
+            let px = ox + map_w + m;
+            Rect::new(px, m, w - px - m, h - m * 2.0)
+        } else {
+            let py = oy + map_h + m;
+            Rect::new(m, py, w - m * 2.0, h - py - m)
+        };
+        Layout { ox, oy, tile, map_w, map_h, panel, u, cam, cols, rows }
+    }
+
+    pub fn view(&self) -> Rect {
+        Rect::new(self.ox, self.oy, self.map_w, self.map_h)
+    }
+
+    /// Size of the viewport in tiles.
+    pub fn view_tiles(&self) -> Vec2 {
+        vec2(self.map_w / self.tile, self.map_h / self.tile)
+    }
+
+    pub fn scrollable(&self) -> bool {
+        self.view_tiles().x + 0.01 < self.cols as f32 || self.view_tiles().y + 0.01 < self.rows as f32
     }
 
     pub fn tile_rect(&self, x: f32, y: f32) -> Rect {
-        Rect::new(self.ox + x * self.tile, self.oy + y * self.tile, self.tile, self.tile)
+        Rect::new(self.ox + (x - self.cam.x) * self.tile, self.oy + (y - self.cam.y) * self.tile, self.tile, self.tile)
     }
 
     pub fn tile_at(&self, p: Vec2) -> Option<(i32, i32)> {
-        let x = ((p.x - self.ox) / self.tile).floor();
-        let y = ((p.y - self.oy) / self.tile).floor();
-        let tw = (self.map_w / self.tile).round();
-        let th = (self.map_h / self.tile).round();
-        if x >= 0.0 && y >= 0.0 && x < tw && y < th {
-            Some((x as i32, y as i32))
+        if !self.view().contains(p) {
+            return None;
+        }
+        let x = (self.cam.x + (p.x - self.ox) / self.tile).floor() as i32;
+        let y = (self.cam.y + (p.y - self.oy) / self.tile).floor() as i32;
+        if x >= 0 && y >= 0 && x < self.cols && y < self.rows {
+            Some((x, y))
         } else {
             None
         }
+    }
+
+    /// Range of tiles at least partly visible: (x0, y0, x1, y1) inclusive.
+    pub fn visible(&self) -> (i32, i32, i32, i32) {
+        let v = self.view_tiles();
+        let x0 = self.cam.x.floor() as i32;
+        let y0 = self.cam.y.floor() as i32;
+        let x1 = ((self.cam.x + v.x).ceil() as i32).min(self.cols - 1);
+        let y1 = ((self.cam.y + v.y).ceil() as i32).min(self.rows - 1);
+        (x0.max(0), y0.max(0), x1, y1)
+    }
+
+    /// Camera position that centres tile `p`.
+    pub fn centred_on(&self, p: Vec2) -> Vec2 {
+        let v = self.view_tiles();
+        p + vec2(0.5, 0.5) - v / 2.0
+    }
+
+    /// Whether tile `p` lies inside the viewport, keeping a margin of `m` tiles.
+    pub fn shows(&self, p: Vec2, m: f32) -> bool {
+        let v = self.view_tiles();
+        let m = m.min(v.x / 3.0).min(v.y / 3.0);
+        p.x >= self.cam.x + m - 0.01 && p.y >= self.cam.y + m - 0.01 && p.x + 1.0 <= self.cam.x + v.x - m + 0.01 && p.y + 1.0 <= self.cam.y + v.y - m + 0.01
     }
 }
 
