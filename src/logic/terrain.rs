@@ -6,6 +6,12 @@ pub enum Terrain {
     Fort,
     Water,
     Bridge,
+    Village,
+    Throne,
+    Wall,
+    Floor,
+    Pillar,
+    Gate,
 }
 
 /// How a unit travels; determines terrain movement costs.
@@ -26,6 +32,12 @@ impl Terrain {
             'T' => Terrain::Fort,
             '~' => Terrain::Water,
             '=' => Terrain::Bridge,
+            'V' => Terrain::Village,
+            'H' => Terrain::Throne,
+            '#' => Terrain::Wall,
+            ',' => Terrain::Floor,
+            'P' => Terrain::Pillar,
+            'G' => Terrain::Gate,
             _ => return None,
         })
     }
@@ -38,21 +50,29 @@ impl Terrain {
             Terrain::Fort => "Fort",
             Terrain::Water => "Water",
             Terrain::Bridge => "Bridge",
+            Terrain::Village => "Village",
+            Terrain::Throne => "Throne",
+            Terrain::Wall => "Wall",
+            Terrain::Floor => "Floor",
+            Terrain::Pillar => "Pillar",
+            Terrain::Gate => "Gate",
         }
     }
 
     pub fn defense(self) -> i32 {
         match self {
-            Terrain::Forest => 1,
+            Terrain::Forest | Terrain::Pillar => 1,
             Terrain::Mountain | Terrain::Fort => 2,
+            Terrain::Throne | Terrain::Gate => 3,
             _ => 0,
         }
     }
 
     pub fn avoid(self) -> i32 {
         match self {
-            Terrain::Forest | Terrain::Fort => 20,
-            Terrain::Mountain => 30,
+            Terrain::Village => 10,
+            Terrain::Forest | Terrain::Fort | Terrain::Pillar | Terrain::Gate => 20,
+            Terrain::Mountain | Terrain::Throne => 30,
             _ => 0,
         }
     }
@@ -60,7 +80,8 @@ impl Terrain {
     /// Percent of max HP restored at the start of the occupant's phase.
     pub fn heal_percent(self) -> i32 {
         match self {
-            Terrain::Fort => 20,
+            Terrain::Fort | Terrain::Throne => 20,
+            Terrain::Gate => 10,
             _ => 0,
         }
     }
@@ -68,9 +89,9 @@ impl Terrain {
     /// Movement points needed to enter this tile, or None if impassable.
     pub fn move_cost(self, mt: MoveType) -> Option<i32> {
         match (self, mt) {
-            (Terrain::Water, _) => None,
-            (Terrain::Plains | Terrain::Bridge, _) => Some(1),
-            (Terrain::Forest | Terrain::Fort, _) => Some(2),
+            (Terrain::Water | Terrain::Wall, _) => None,
+            (Terrain::Plains | Terrain::Bridge | Terrain::Village | Terrain::Floor | Terrain::Throne | Terrain::Gate, _) => Some(1),
+            (Terrain::Forest | Terrain::Fort | Terrain::Pillar, _) => Some(2),
             (Terrain::Mountain, MoveType::Infantry) => Some(3),
             (Terrain::Mountain, MoveType::Mountaineer) => Some(2),
         }

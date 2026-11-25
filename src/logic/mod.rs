@@ -3,16 +3,17 @@
 
 pub mod ai;
 pub mod battle;
+pub mod campaign;
 pub mod combat;
+pub mod items;
 pub mod map;
 pub mod pathfinding;
 pub mod rng;
-pub mod scenario;
 pub mod terrain;
 pub mod unit;
 
 /// A tile coordinate on the battle map.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Pos {
     pub x: i32,
     pub y: i32,

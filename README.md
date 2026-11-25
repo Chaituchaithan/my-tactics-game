@@ -3,26 +3,40 @@
 An original retro tactical RPG for Android (and desktop), written in Rust with [macroquad](https://macroquad.rs).
 All art is pixel art drawn in code; no external assets.
 
-**Milestone 1 – "The Ashford Crossing":** one complete battle on a 16×12 map. Five allies (Lord, Lancer, Archer, Mage, Cleric) face eight enemies led by the warlord Varga Ironjaw. Defeat Varga to win. If Kael, your lord, falls, the battle is lost.
+A complete 8-chapter campaign:
+
+| # | Chapter | Objective | Notes |
+|---|---|---|---|
+| 1 | The Ashford Crossing | Defeat Varga | Tutorial-sized; a village to visit |
+| 2 | Ember Woods | Rout | Holt joins; talk to **Dain** to recruit him; reinforcements |
+| 3 | Hollowmere Must Stand | Survive 6 turns | Sera joins; enemies pour in from every side |
+| 4 | Saltmarsh Keep | Seize the throne | Talk to **Ilse**; a Master Seal in the village |
+| 5 | Ironpeak Pass | Defeat Thorne | Maeve joins; mountain warfare |
+| 6 | The Ashen Wall | Rout | Bram joins; promoted enemy classes |
+| 7 | The Burning Bridge | Survive 7 turns | Talk to **Corvin**; hold the bridge |
+| 8 | Throne of Ash | Defeat Morvaine | Final battle, then the ending |
+
+Between chapters you get a **story scene** and a **preparations screen**: army and inventories (equip, discard, give items, use Master Seals, reorder who deploys) and an **armory** that sells weapons, staves and consumables. Progress **auto-saves** before each battle. Choose **Continue** on the title screen to resume.
 
 ## Rules at a glance
 
 | | |
 |---|---|
-| Terrain | Plains · Forest (+1 Def, +20 Avo, cost 2) · Mountain (+2 Def, +30 Avo, cost 3; axe users 2) · Fort (+2 Def, +20 Avo, heals 20%/turn) · Water (impassable) · Bridge |
+| Terrain | Plains, Forest (+1 Def, +20 Avo), Mountain (+2/+30), Fort (+2/+20, heals 20%), Village (visit for gifts), Castle floor, Pillar (+1/+20), Gate (+3/+20), Throne (+3/+30, heals), Water and Walls (impassable) |
 | Weapon triangle | Sword > Axe > Lance > Sword (±1 damage, ±15 hit) |
 | Damage | Str/Mag + weapon Mt − Def/Res − terrain Def |
 | Hit | Wpn Hit + 2·Skl + Lck/2 − (2·Spd + Lck + terrain Avo) |
 | Crit | Wpn Crit + Skl/2 − foe Lck, triple damage |
 | Doubling | Spd ≥ foe Spd + 4 → strike twice |
-| Counters | Defender strikes back if the distance is within its weapon's range (bows: 2 only; tomes: 1–2; staves never) |
-| XP | Hit ≈ 10, kill ≈ 30 (scaled by level gap), boss +40, heal 12. 100 XP = level up, rolled against growth rates |
-| Phases | Player phase → enemy phase. Enemies attack the best target they can reach, otherwise advance; the boss holds his fort |
-| Permadeath | Toggle on the title screen. On: fallen allies are lost forever. Off: they retreat and return later |
+| Counters | Only if the attacker is within the defender's weapon range (bows 2, javelins/hand axes/tomes 1–2, staves never) |
+| Weapons | 27 items. Weapons have uses and break. Up to 5 items per unit. Tap **Weapon** in the forecast to switch |
+| Classes | 10 base classes, plus 8 promoted ones at Lv 10+ with a Master Seal. Promoted classes gain stats, +1 Mov and a second weapon type |
+| XP | Hit ≈ 10, kill ≈ 30 (scaled by level gap), boss +40, heal 12. 100 XP = level up, rolled against personal growth rates |
+| AI | Aggressive units charge, guards wait for you to come into range, bosses hold their ground |
+| Permadeath | Chosen at New Game. On: fallen allies are gone for good. Off: they return next chapter |
 
-**Controls (touch or mouse):** tap a blue unit → tap a blue tile to move → choose **Attack / Heal / Wait / Cancel**.
-Choosing Attack shows the combat forecast. Tap another red target to compare, then tap the target again or press **Attack!** to fight.
-Tap an enemy to see its movement and attack range. **Enemy Range** shows every tile any enemy can threaten. **End Turn** ends your phase early.
+**Controls (touch or mouse):** tap a blue unit, then a blue tile to move. Then choose **Attack / Heal / Talk / Visit / Seize / Items / Wait / Cancel**.
+Attack shows the combat forecast. Tap the target again (or **Attack!**) to fight. Tap an enemy to see its range. **Enemy Range** shows every tile under threat.
 
 ## Project layout
 
@@ -32,12 +46,16 @@ src/logic/        pure game rules, no rendering (unit-tested)
   unit.rs         classes, weapons, stats, growth rates, level-ups
   combat.rs       forecast + resolution formulas, XP
   pathfinding.rs  Dijkstra movement range, paths, attack ranges
+  items.rs        weapon/item catalogue and shop list
   ai.rs           enemy decision making
-  battle.rs       battle state: phases, actions, win/lose
-  scenario.rs     the map and roster for the first battle
+  battle.rs       battle state: phases, objectives, reinforcements, villages, talk, items
+  campaign.rs     the 8 chapters (maps, rosters, story) and the saved campaign state
 src/ui/           macroquad rendering and input
   gfx.rs          code-drawn pixel art (terrain, units)
   battle_screen.rs input state machine, animation queue, panel, forecast
+  story.rs        dialogue scenes
+  prep.rs         preparations: army, items, shop
+  storage.rs      save file
   widgets.rs      layout, buttons, tap input
 ```
 
@@ -45,7 +63,7 @@ src/ui/           macroquad rendering and input
 
 ```sh
 cargo run --release   # play
-cargo test            # 46 unit tests (combat, pathfinding, AI, battle rules)
+cargo test            # 70 tests: combat, pathfinding, AI, items, campaign, plus an auto-battle of every chapter
 ```
 
 ## Building the APK

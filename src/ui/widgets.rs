@@ -50,10 +50,6 @@ impl Input {
     pub fn take(&mut self) -> Option<Vec2> {
         self.tap.take()
     }
-
-    pub fn any(&self) -> bool {
-        self.tap.is_some()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,28 +181,67 @@ pub fn hp_bar(x: f32, y: f32, w: f32, h: f32, hp: i32, max: i32) {
     draw_rectangle(x + 1.0, y + 1.0, (w - 2.0) * frac, h - 2.0, c);
 }
 
-/// Vertical stack of full-width buttons growing upward from the bottom of `area`.
+/// Grid of buttons growing upward from the bottom of `area`, `cols` per row.
 pub struct ButtonColumn {
     area: Rect,
     h: f32,
     gap: f32,
     used: f32,
+    cols: usize,
+    in_row: usize,
 }
 
 impl ButtonColumn {
     pub fn new(area: Rect, u: f32) -> Self {
-        ButtonColumn { area, h: (u * 2.1).floor(), gap: (u * 0.4).floor(), used: 0.0 }
+        Self::grid(area, u, 1)
+    }
+
+    pub fn grid(area: Rect, u: f32, cols: usize) -> Self {
+        ButtonColumn { area, h: (u * 2.1).floor(), gap: (u * 0.4).floor(), used: 0.0, cols: cols.max(1), in_row: 0 }
     }
 
     pub fn next(&mut self) -> Rect {
-        self.used += self.h;
-        let r = Rect::new(self.area.x, self.area.y + self.area.h - self.used, self.area.w, self.h);
-        self.used += self.gap;
+        if self.in_row == 0 {
+            self.used += self.h;
+        }
+        let w = (self.area.w - self.gap * (self.cols - 1) as f32) / self.cols as f32;
+        let x = self.area.x + self.in_row as f32 * (w + self.gap);
+        let r = Rect::new(x, self.area.y + self.area.h - self.used, w, self.h);
+        self.in_row += 1;
+        if self.in_row == self.cols {
+            self.in_row = 0;
+            self.used += self.gap;
+        }
         r
     }
 
     /// Top of the stack so far (for placing content above).
     pub fn top(&self) -> f32 {
-        self.area.y + self.area.h - self.used
+        let partial = if self.in_row > 0 { self.gap } else { 0.0 };
+        self.area.y + self.area.h - self.used - partial
     }
+}
+
+/// Greedy word wrap to `max_w` pixels.
+pub fn wrap(s: &str, max_w: f32, size: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let candidate = if cur.is_empty() { word.to_string() } else { format!("{} {}", cur, word) };
+        if text_w(&candidate, size) > max_w && !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        } else {
+            cur = candidate;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Base UI unit (font size) for full-screen menus.
+pub fn ui_unit() -> f32 {
+    (screen_width().min(screen_height()) / 26.0).clamp(14.0, 48.0)
 }

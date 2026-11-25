@@ -86,9 +86,72 @@ fn tree(px: &Px, cx: f32, top: f32) {
     px.r(cx - 2.0, top + 4.0, 2.0, 1.0, mid);
 }
 
-pub fn draw_terrain(t: Terrain, x: f32, y: f32, size: f32, tx: i32, ty: i32, time: f32) {
+fn floor(px: &Px, tx: i32, ty: i32) {
+    let a = rgb(118, 112, 124);
+    let b = rgb(104, 98, 112);
+    px.r(0.0, 0.0, 16.0, 16.0, if (tx + ty) % 2 == 0 { a } else { b });
+    px.r(0.0, 0.0, 16.0, 1.0, rgb(90, 84, 98));
+    px.r(0.0, 0.0, 1.0, 16.0, rgb(90, 84, 98));
+}
+
+fn bricks(px: &Px, tx: i32, ty: i32) {
+    px.r(0.0, 0.0, 16.0, 16.0, rgb(70, 66, 82));
+    let mortar = rgb(48, 44, 58);
+    for row in 0..4 {
+        let y = row as f32 * 4.0;
+        px.r(0.0, y, 16.0, 1.0, mortar);
+        let off = if (row + ty) % 2 == 0 { 0.0 } else { 4.0 };
+        for k in 0..3 {
+            px.r((off + k as f32 * 8.0 + (tx % 2) as f32) % 16.0, y, 1.0, 4.0, mortar);
+        }
+    }
+    px.r(0.0, 0.0, 16.0, 2.0, rgb(96, 92, 108));
+}
+
+/// `alt` marks a visited village.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_terrain(t: Terrain, x: f32, y: f32, size: f32, tx: i32, ty: i32, time: f32, alt: bool) {
     let px = Px::new(x, y, size);
     match t {
+        Terrain::Village => {
+            grass(&px, tx, ty);
+            let roof = if alt { rgb(110, 90, 80) } else { rgb(196, 70, 52) };
+            let wall = rgb(226, 206, 160);
+            px.r(3.0, 8.0, 10.0, 6.0, wall);
+            px.r(2.0, 6.0, 12.0, 2.0, roof);
+            px.r(4.0, 4.0, 8.0, 2.0, roof);
+            px.r(6.0, 2.0, 4.0, 2.0, roof);
+            px.r(7.0, 10.0, 2.0, 4.0, if alt { rgb(60, 50, 44) } else { rgb(120, 76, 40) });
+            px.r(4.0, 9.0, 2.0, 2.0, rgb(120, 170, 220));
+            px.r(10.0, 9.0, 2.0, 2.0, rgb(120, 170, 220));
+            px.r(2.0, 14.0, 12.0, 1.0, rgb(70, 120, 56));
+        }
+        Terrain::Floor => floor(&px, tx, ty),
+        Terrain::Wall => bricks(&px, tx, ty),
+        Terrain::Pillar => {
+            floor(&px, tx, ty);
+            px.r(5.0, 1.0, 6.0, 14.0, rgb(170, 166, 180));
+            px.r(4.0, 1.0, 8.0, 2.0, rgb(196, 192, 206));
+            px.r(4.0, 13.0, 8.0, 2.0, rgb(196, 192, 206));
+            px.r(9.0, 3.0, 2.0, 10.0, rgb(130, 126, 142));
+        }
+        Terrain::Throne => {
+            floor(&px, tx, ty);
+            px.r(4.0, 0.0, 8.0, 16.0, rgb(150, 30, 40));
+            px.r(5.0, 2.0, 6.0, 9.0, rgb(210, 170, 60));
+            px.r(6.0, 3.0, 4.0, 6.0, rgb(120, 24, 60));
+            px.r(4.0, 9.0, 8.0, 3.0, rgb(210, 170, 60));
+            px.r(7.0, 1.0, 2.0, 1.0, rgb(250, 230, 120));
+        }
+        Terrain::Gate => {
+            bricks(&px, tx, ty);
+            px.r(3.0, 3.0, 10.0, 13.0, rgb(40, 32, 30));
+            for i in 0..4 {
+                px.r(4.0 + i as f32 * 2.6, 3.0, 1.0, 13.0, rgb(120, 116, 130));
+            }
+            px.r(3.0, 7.0, 10.0, 1.0, rgb(120, 116, 130));
+            px.r(3.0, 11.0, 10.0, 1.0, rgb(120, 116, 130));
+        }
         Terrain::Plains => grass(&px, tx, ty),
         Terrain::Forest => {
             grass(&px, tx, ty);
@@ -160,6 +223,16 @@ pub struct UnitLook {
     pub boss: bool,
 }
 
+impl UnitLook {
+    pub fn of(u: &crate::logic::unit::Unit) -> UnitLook {
+        let weapon = u.weapon().map(|w| w.kind).or_else(|| u.staff().map(|w| w.kind)).unwrap_or(match u.class.info().kinds.first() {
+            Some(k) => *k,
+            None => WeaponKind::Sword,
+        });
+        UnitLook { class: u.class, team: u.team, weapon, boss: u.is_boss }
+    }
+}
+
 pub fn team_colors(team: Team, boss: bool) -> (Color, Color) {
     match (team, boss) {
         (Team::Player, _) => (rgb(64, 116, 222), rgb(32, 58, 140)),
@@ -187,39 +260,52 @@ pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f
     // Shadow (not greyed / flipped meaningfully)
     draw_rectangle(x + size * 0.22, y + size * 0.86, size * 0.56, size * 0.1, Color::new(0.0, 0.0, 0.0, 0.25 * alpha));
 
-    let robed = matches!(look.class, Class::Mage | Class::Cleric);
-    let robe = if look.class == Class::Cleric { white } else { main };
+    let promoted = look.class.is_promoted();
+    let sorcerer = look.class == Class::Sorcerer;
+    let class = if sorcerer { Class::Mage } else { look.class.base_look() };
+    let (main, dark) = if sorcerer { (rgb(60, 30, 80), rgb(28, 12, 40)) } else { (main, dark) };
+    let robed = matches!(class, Class::Mage | Class::Cleric);
+    let robe = if class == Class::Cleric { white } else { main };
 
-    // Cape for lord / boss
-    if matches!(look.class, Class::Lord | Class::Warlord) {
+    // Cape for lords, bosses and promoted units
+    if matches!(class, Class::Lord | Class::Warlord) || promoted {
         px.r(3.0, 7.0, 9.0, 7.0, dark);
+        if promoted {
+            px.r(3.0, 13.0, 9.0, 1.0, gold);
+        }
     }
 
     // Legs or robe
     if robed {
         px.r(4.0, 7.0, 8.0, 7.0, robe);
         px.r(4.0, 13.0, 8.0, 1.0, dark);
-        px.r(7.0, 7.0, 2.0, 7.0, if look.class == Class::Cleric { main } else { dark });
+        px.r(7.0, 7.0, 2.0, 7.0, if class == Class::Cleric { main } else { dark });
     } else {
         px.r(5.0, 11.0, 2.0, 3.0, dark);
         px.r(9.0, 11.0, 2.0, 3.0, dark);
         px.r(5.0, 13.0, 2.0, 1.0, boots);
         px.r(9.0, 13.0, 2.0, 1.0, boots);
         // Torso
-        let torso = if matches!(look.class, Class::Brigand) { rgb(150, 110, 70) } else { main };
+        let torso = if matches!(class, Class::Brigand) { rgb(150, 110, 70) } else { main };
         px.r(4.0, 7.0, 8.0, 4.0, torso);
         px.r(4.0, 10.0, 8.0, 1.0, wood);
-        if matches!(look.class, Class::Soldier | Class::Lancer | Class::Warlord) {
+        if matches!(class, Class::Soldier | Class::Lancer | Class::Warlord) {
             px.r(5.0, 7.0, 6.0, 2.0, metal);
         }
-        if look.class == Class::Warlord {
+        if class == Class::Knight {
+            px.r(3.0, 6.0, 10.0, 6.0, metal);
+            px.r(4.0, 7.0, 8.0, 3.0, main);
+            px.r(4.0, 11.0, 3.0, 3.0, metal);
+            px.r(9.0, 11.0, 3.0, 3.0, metal);
+        }
+        if class == Class::Warlord {
             px.r(3.0, 6.0, 3.0, 2.0, gold);
             px.r(10.0, 6.0, 3.0, 2.0, gold);
         }
     }
 
     // Arms
-    let arm = if look.class == Class::Brigand { skin } else { dark };
+    let arm = if matches!(class, Class::Brigand | Class::Fighter) { skin } else { dark };
     px.r(3.0, 7.0, 1.0, 3.0, arm);
     px.r(12.0, 7.0, 1.0, 3.0, arm);
     px.dot(3.0, 10.0, skin);
@@ -232,7 +318,7 @@ pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f
     px.dot(7.0, 4.0, outline);
 
     // Headgear / hair
-    match look.class {
+    match class {
         Class::Lord => {
             px.r(5.0, 1.0, 6.0, 2.0, rgb(120, 70, 40));
             px.r(4.0, 2.0, 1.0, 3.0, rgb(120, 70, 40));
@@ -254,6 +340,15 @@ pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f
             px.r(4.0, 2.0, 1.0, 2.0, main);
             px.r(6.0, 6.0, 4.0, 1.0, rgb(90, 50, 30));
         }
+        Class::Fighter => {
+            px.r(5.0, 1.0, 6.0, 2.0, rgb(90, 60, 40));
+            px.r(4.0, 2.0, 8.0, 1.0, main);
+        }
+        Class::Knight => {
+            px.r(4.0, 0.0, 8.0, 7.0, metal);
+            px.r(5.0, 3.0, 6.0, 2.0, rgb(40, 40, 50));
+            px.r(6.0, -1.0, 4.0, 1.0, main);
+        }
         Class::Warlord => {
             px.r(4.0, 0.0, 8.0, 3.0, rgb(70, 70, 82));
             px.r(3.0, -2.0, 1.0, 3.0, white);
@@ -265,19 +360,27 @@ pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f
             px.r(4.0, 3.0, 1.0, 4.0, dark);
             px.r(11.0, 3.0, 1.0, 3.0, dark);
         }
-        Class::Mage => {
+        Class::Mage | Class::Sage | Class::Sorcerer => {
+            if sorcerer {
+                px.r(3.0, -2.0, 1.0, 3.0, rgb(200, 190, 210));
+                px.r(12.0, -2.0, 1.0, 3.0, rgb(200, 190, 210));
+            }
             px.r(4.0, 2.0, 8.0, 1.0, dark);
             px.r(5.0, 1.0, 6.0, 1.0, main);
             px.r(6.0, 0.0, 4.0, 1.0, main);
             px.r(7.0, -1.0, 3.0, 1.0, main);
             px.r(9.0, -2.0, 2.0, 1.0, main);
         }
-        Class::Cleric => {
+        Class::Cleric | Class::Bishop => {
             px.r(4.0, 1.0, 8.0, 2.0, white);
             px.r(4.0, 3.0, 1.0, 4.0, white);
             px.r(11.0, 3.0, 1.0, 4.0, white);
             px.r(5.0, 1.0, 6.0, 1.0, gold);
         }
+        _ => {}
+    }
+    if promoted {
+        px.r(7.0, 7.0, 2.0, 2.0, gold);
     }
 
     // Weapon on the facing side
@@ -316,4 +419,15 @@ pub fn draw_unit(look: UnitLook, x: f32, y: f32, size: f32, done: bool, alpha: f
             px.dot(13.0, 1.0, white);
         }
     }
+}
+
+/// Character portrait for dialogue: the sprite, large, in a framed box.
+pub fn draw_portrait(look: UnitLook, x: f32, y: f32, size: f32) {
+    draw_rectangle(x, y, size, size, rgb(54, 60, 96));
+    draw_rectangle(x, y + size * 0.6, size, size * 0.4, rgb(44, 48, 80));
+    let mut l = look;
+    l.team = Team::Player; // face right
+    let (main, _) = team_colors(look.team, look.boss);
+    draw_unit(UnitLook { team: look.team, ..l }, x + size * 0.05, y + size * 0.12, size * 0.9, false, 1.0, false);
+    draw_rectangle_lines(x, y, size, size, 3.0, main);
 }

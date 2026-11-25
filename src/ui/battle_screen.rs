@@ -2,7 +2,7 @@
 //!
 //! Logic changes are applied to `Battle` instantly; the screen then replays
 //! them through a queue of visual effects (`Fx`) using its own copy of unit
-//! positions/HP, so rendering never leaks into the rules.
+//! positions/HP/teams, so rendering never leaks into the rules.
 
 use std::collections::{HashSet, VecDeque};
 use std::f32::consts::PI;
@@ -12,17 +12,20 @@ use macroquad::prelude::*;
 use super::gfx::{self, rgb, UnitLook};
 use super::widgets::*;
 use crate::logic::ai::{self, AiAction};
-use crate::logic::battle::{Battle, CombatReport, Outcome, Phase, XpEvent};
+use crate::logic::battle::{Battle, CombatReport, ItemUse, Objective, Outcome, Phase, PhaseStart, Reward, XpEvent};
+use crate::logic::campaign::{chapter, Line};
 use crate::logic::combat::{self, Forecast, Side, SideForecast};
+use crate::logic::items::ItemKind;
 use crate::logic::pathfinding::Reach;
-use crate::logic::scenario::BATTLE_NAME;
-use crate::logic::unit::{LevelUp, Team, Unit, STAT_NAMES};
+use crate::logic::terrain::MoveType;
+use crate::logic::unit::{LevelUp, Promotion, Team, STAT_NAMES};
 use crate::logic::Pos;
 
 pub enum BattleExit {
     Stay,
-    Title,
+    Victory,
     Retry,
+    Title,
 }
 
 const STEP_TIME: f32 = 0.07;
@@ -30,6 +33,7 @@ const STRIKE_TIME: f32 = 0.7;
 
 enum Fx {
     Banner { text: String, color: Color },
+    Notice { text: String, color: Color },
     Pause(f32),
     Move { unit: usize, path: Vec<Pos> },
     CombatBegin { a: usize, d: usize },
@@ -37,8 +41,12 @@ enum Fx {
     CombatEnd,
     Heal { target: usize, amount: i32, hp_after: i32 },
     Die { unit: usize },
+    Spawn { unit: usize },
     Xp { unit: usize, from: i32, gained: i32 },
     LevelUp { unit: usize, lv: LevelUp },
+    Promote { unit: usize, p: Promotion },
+    Say { speaker: String, text: String },
+    Recruit { unit: usize },
 }
 
 impl Fx {
@@ -46,6 +54,7 @@ impl Fx {
     fn duration(&self) -> Option<f32> {
         Some(match self {
             Fx::Banner { .. } => 1.3,
+            Fx::Notice { .. } => 1.2,
             Fx::Pause(t) => *t,
             Fx::Move { path, .. } => STEP_TIME * path.len().saturating_sub(1) as f32,
             Fx::CombatBegin { .. } => 0.3,
@@ -53,8 +62,10 @@ impl Fx {
             Fx::CombatEnd => 0.35,
             Fx::Heal { .. } => 0.8,
             Fx::Die { .. } => 0.7,
+            Fx::Spawn { .. } => 0.5,
             Fx::Xp { .. } => 1.1,
-            Fx::LevelUp { .. } => return None,
+            Fx::Recruit { .. } => 0.6,
+            Fx::LevelUp { .. } | Fx::Promote { .. } | Fx::Say { .. } => return None,
         })
     }
 }
@@ -66,17 +77,28 @@ struct Float {
     color: Color,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    Attack,
+    Heal,
+    Talk,
+}
+
 enum Mode {
     Idle,
     Selected { unit: usize, reach: Reach, dests: HashSet<Pos>, threat: HashSet<Pos> },
     Menu { unit: usize, from: Pos },
-    Target { unit: usize, from: Pos, targets: Vec<usize>, heal: bool, chosen: Option<usize> },
+    Items { unit: usize, from: Pos },
+    Target { unit: usize, from: Pos, targets: Vec<usize>, kind: TargetKind, chosen: Option<usize> },
     EnemyPhase { queue: VecDeque<usize> },
     Over { victory: bool },
 }
 
 pub struct BattleScreen {
     b: Battle,
+    chapter: usize,
+    title: String,
+    talks: Vec<(&'static str, Vec<Line>)>,
     mode: Mode,
     fx: VecDeque<Fx>,
     fx_t: f32,
@@ -84,6 +106,7 @@ pub struct BattleScreen {
     vis_pos: Vec<Vec2>,
     vis_hp: Vec<i32>,
     vis_alpha: Vec<f32>,
+    vis_team: Vec<Team>,
     floats: Vec<Float>,
     combat_pair: Option<(usize, usize)>,
     inspect: Option<Pos>,
@@ -98,10 +121,6 @@ fn pv(p: Pos) -> Vec2 {
     vec2(p.x as f32, p.y as f32)
 }
 
-fn look(u: &Unit) -> UnitLook {
-    UnitLook { class: u.class, team: u.team, weapon: u.weapon.kind, boss: u.is_boss }
-}
-
 fn team_ink(team: Team) -> Color {
     match team {
         Team::Player => ALLY,
@@ -110,21 +129,22 @@ fn team_ink(team: Team) -> Color {
 }
 
 impl BattleScreen {
-    pub fn new(seed: u64, permadeath: bool) -> BattleScreen {
-        let mut b = Battle::first_battle(seed, permadeath);
+    pub fn new(mut b: Battle, chapter_index: usize) -> BattleScreen {
         b.begin_phase(Phase::Player);
-        let vis_pos = b.units.iter().map(|u| pv(u.pos)).collect();
-        let vis_hp = b.units.iter().map(|u| u.hp).collect();
-        let vis_alpha = b.units.iter().map(|_| 1.0).collect();
+        let def = chapter(chapter_index);
         let mut s = BattleScreen {
             b,
+            chapter: chapter_index,
+            title: def.title.to_string(),
+            talks: def.talks,
             mode: Mode::Idle,
             fx: VecDeque::new(),
             fx_t: 0.0,
             fx_started: false,
-            vis_pos,
-            vis_hp,
-            vis_alpha,
+            vis_pos: Vec::new(),
+            vis_hp: Vec::new(),
+            vis_alpha: Vec::new(),
+            vis_team: Vec::new(),
             floats: Vec::new(),
             combat_pair: None,
             inspect: None,
@@ -133,14 +153,38 @@ impl BattleScreen {
             danger: None,
             time: 0.0,
         };
-        s.fx.push_back(Fx::Banner { text: BATTLE_NAME.to_string(), color: ACCENT });
-        s.fx.push_back(Fx::Banner { text: "Player Phase".into(), color: ALLY });
+        s.sync_vis();
+        for a in s.vis_alpha.iter_mut() {
+            *a = 1.0;
+        }
+        s.fx.push_back(Fx::Banner { text: format!("Chapter {}: {}", chapter_index + 1, s.title), color: ACCENT });
+        s.fx.push_back(Fx::Notice { text: s.b.objective_text(), color: ACCENT });
         s
+    }
+
+    pub fn battle(&self) -> &Battle {
+        &self.b
+    }
+
+    pub fn chapter(&self) -> usize {
+        self.chapter
+    }
+
+    /// Grows the visual arrays when units are added (reinforcements). New units start invisible.
+    fn sync_vis(&mut self) {
+        while self.vis_pos.len() < self.b.units.len() {
+            let u = &self.b.units[self.vis_pos.len()];
+            self.vis_pos.push(pv(u.pos));
+            self.vis_hp.push(u.hp);
+            self.vis_alpha.push(0.0);
+            self.vis_team.push(u.team);
+        }
     }
 
     pub fn frame(&mut self) -> BattleExit {
         let dt = get_frame_time().min(0.05);
         self.time += dt;
+        self.sync_vis();
         let lay = Layout::compute(self.b.map.width, self.b.map.height);
         let mut input = Input::poll();
 
@@ -184,7 +228,7 @@ impl BattleScreen {
         self.fx_t += dt;
         let done = match self.fx.front().and_then(|f| f.duration()) {
             Some(d) => self.fx_t >= d,
-            None => self.fx_t > 0.4 && input.take().is_some(),
+            None => self.fx_t > 0.3 && input.take().is_some(),
         };
         if done {
             let fx = self.fx.pop_front().unwrap();
@@ -226,7 +270,13 @@ impl BattleScreen {
                 }
             }
             Fx::Die { unit } => self.vis_alpha[unit] = 0.0,
+            Fx::Spawn { unit } => {
+                self.vis_alpha[unit] = 1.0;
+                self.vis_hp[unit] = self.b.units[unit].hp;
+            }
             Fx::CombatEnd => self.combat_pair = None,
+            Fx::Recruit { unit } => self.vis_team[unit] = Team::Player,
+            Fx::Promote { unit, .. } => self.vis_hp[unit] = self.b.units[unit].hp,
             _ => {}
         }
     }
@@ -254,20 +304,32 @@ impl BattleScreen {
         };
     }
 
+    fn push_phase_start(&mut self, start: PhaseStart) {
+        self.sync_vis();
+        if !start.spawned.is_empty() {
+            self.fx.push_back(Fx::Notice { text: "Enemy reinforcements!".into(), color: BAD });
+            for id in start.spawned {
+                self.fx.push_back(Fx::Spawn { unit: id });
+            }
+        }
+        for h in start.heals {
+            self.fx.push_back(Fx::Heal { target: h.unit, amount: h.amount, hp_after: h.hp_after });
+        }
+    }
+
     fn start_enemy_phase(&mut self) -> Mode {
-        let heals = self.b.begin_phase(Phase::Enemy);
+        let start = self.b.begin_phase(Phase::Enemy);
         self.inspect = None;
         self.inspect_range = None;
         self.fx.push_back(Fx::Banner { text: "Enemy Phase".into(), color: BAD });
-        for h in heals {
-            self.fx.push_back(Fx::Heal { target: h.unit, amount: h.amount, hp_after: h.hp_after });
-        }
+        self.push_phase_start(start);
+        self.danger = None;
         Mode::EnemyPhase { queue: self.b.living(Team::Enemy).collect() }
     }
 
     fn enemy_step(&mut self, mut queue: VecDeque<usize>) -> Mode {
         while let Some(id) = queue.pop_front() {
-            if !self.b.units[id].alive {
+            if !self.b.units[id].alive || self.b.units[id].team != Team::Enemy {
                 continue;
             }
             match ai::decide(&self.b, id) {
@@ -287,11 +349,11 @@ impl BattleScreen {
             self.danger = None;
             return Mode::EnemyPhase { queue };
         }
-        let heals = self.b.begin_phase(Phase::Player);
-        self.fx.push_back(Fx::Banner { text: format!("Player Phase - Turn {}", self.b.turn), color: ALLY });
-        for h in heals {
-            self.fx.push_back(Fx::Heal { target: h.unit, amount: h.amount, hp_after: h.hp_after });
+        let start = self.b.begin_phase(Phase::Player);
+        if self.b.outcome() == Outcome::Ongoing {
+            self.fx.push_back(Fx::Banner { text: format!("Player Phase - Turn {}", self.b.turn), color: ALLY });
         }
+        self.push_phase_start(start);
         self.danger = None;
         Mode::Idle
     }
@@ -310,6 +372,11 @@ impl BattleScreen {
         }
     }
 
+    fn push_broken(&mut self, unit: usize, item: &str) {
+        let name = self.b.units[unit].name.clone();
+        self.fx.push_back(Fx::Notice { text: format!("{}'s {} broke!", name, item), color: BAD });
+    }
+
     fn push_combat(&mut self, r: &CombatReport) {
         self.fx.push_back(Fx::CombatBegin { a: r.attacker, d: r.defender });
         for s in &r.outcome.strikes {
@@ -322,6 +389,11 @@ impl BattleScreen {
         self.fx.push_back(Fx::CombatEnd);
         for &d in &r.deaths {
             self.fx.push_back(Fx::Die { unit: d });
+        }
+        for (u, item) in r.broken.clone() {
+            if self.b.units[u].team == Team::Player {
+                self.push_broken(u, item);
+            }
         }
         if let Some(x) = &r.xp {
             self.push_xp(x);
@@ -366,6 +438,13 @@ impl BattleScreen {
         Mode::Idle
     }
 
+    fn choose_target(&mut self, unit: usize, t: usize, kind: TargetKind) {
+        if kind == TargetKind::Attack {
+            let d = self.b.units[unit].pos.manhattan(self.b.units[t].pos);
+            self.b.units[unit].equip_for_range(d);
+        }
+    }
+
     fn handle_map_tap(&mut self, lay: &Layout, input: &mut Input) {
         if self.b.phase != Phase::Player {
             return;
@@ -390,30 +469,56 @@ impl BattleScreen {
                     Mode::Selected { unit, reach, dests, threat }
                 }
             }
-            Mode::Target { unit, from, targets, heal, chosen } => match self.b.unit_at(p).filter(|t| targets.contains(t)) {
-                Some(t) if chosen == Some(t) => self.execute(unit, t, heal),
-                Some(t) => Mode::Target { unit, from, targets, heal, chosen: Some(t) },
-                None => Mode::Target { unit, from, targets, heal, chosen },
+            Mode::Target { unit, from, targets, kind, chosen } => match self.b.unit_at(p).filter(|t| targets.contains(t)) {
+                Some(t) if chosen == Some(t) => self.execute(unit, t, kind),
+                Some(t) => {
+                    self.choose_target(unit, t, kind);
+                    Mode::Target { unit, from, targets, kind, chosen: Some(t) }
+                }
+                None => Mode::Target { unit, from, targets, kind, chosen },
             },
             other => other,
         };
     }
 
-    fn execute(&mut self, unit: usize, target: usize, heal: bool) -> Mode {
-        if heal {
-            let r = self.b.heal(unit, target);
-            self.fx.push_back(Fx::Heal { target: r.target, amount: r.amount, hp_after: r.hp_after });
-            if let Some(x) = &r.xp {
-                self.push_xp(x);
+    fn execute(&mut self, unit: usize, target: usize, kind: TargetKind) -> Mode {
+        match kind {
+            TargetKind::Heal => {
+                let r = self.b.heal(unit, target);
+                self.fx.push_back(Fx::Heal { target: r.target, amount: r.amount, hp_after: r.hp_after });
+                if let Some(name) = r.broken {
+                    self.push_broken(unit, name);
+                }
+                if let Some(x) = &r.xp {
+                    self.push_xp(x);
+                }
             }
-        } else {
-            let r = self.b.attack(unit, target);
-            self.push_combat(&r);
+            TargetKind::Attack => {
+                let r = self.b.attack(unit, target);
+                self.push_combat(&r);
+            }
+            TargetKind::Talk => {
+                let name = self.b.units[target].name.clone();
+                let lines = self.talks.iter().find(|(n, _)| *n == name).map(|(_, l)| l.clone()).unwrap_or_default();
+                for line in lines {
+                    self.fx.push_back(Fx::Say { speaker: line.speaker.to_string(), text: line.text.to_string() });
+                }
+                self.b.recruit(target);
+                self.fx.push_back(Fx::Recruit { unit: target });
+                self.fx.push_back(Fx::Notice { text: format!("{} joined the army!", name), color: GOOD });
+            }
         }
         self.b.finish_action(unit);
         self.inspect = None;
         self.danger = None;
         Mode::Idle
+    }
+
+    fn reward_text(&self, r: Reward) -> String {
+        match r {
+            Reward::Gold(g) => format!("The villagers give you {} gold.", g),
+            Reward::Item(i) => format!("The villagers give you a {}.", i.name()),
+        }
     }
 
     // ----------------------------------------------------------------- panel
@@ -430,110 +535,55 @@ impl BattleScreen {
             Phase::Player => ("Player Phase", ALLY),
             Phase::Enemy => ("Enemy Phase", BAD),
         };
-        text(&format!("Turn {}", self.b.turn), inner.x, y, u, INK);
-        text_right(phase_text, inner.x + inner.w, y, u, phase_color);
+        text(&format!("Ch.{}  Turn {}", self.chapter + 1, self.b.turn), inner.x, y, u, INK);
+        text_right(phase_text, inner.x + inner.w, y, u * 0.9, phase_color);
         y += u * 1.1;
-        let boss = self.b.units.iter().find(|u| u.is_boss).map(|u| u.name.clone()).unwrap_or_default();
-        let lord = self.b.units.iter().find(|u| u.is_lord).map(|u| u.name.clone()).unwrap_or_default();
-        text(&format!("Rout: defeat {}", boss), inner.x, y, u * 0.8, ACCENT);
+        text(&self.b.objective_text(), inner.x, y, u * 0.8, ACCENT);
         y += u * 0.9;
-        text(&format!("{} must survive", lord), inner.x, y, u * 0.8, DIM);
+        let lord = self.b.units.iter().find(|u| u.is_lord).map(|u| u.name.clone()).unwrap_or_default();
+        let gold = if self.b.gold > 0 { format!("   +{}G", self.b.gold) } else { String::new() };
+        text(&format!("{} must survive{}", lord, gold), inner.x, y, u * 0.75, DIM);
         y += u * 0.6;
         draw_line(inner.x, y, inner.x + inner.w, y, 2.0, rgb(80, 70, 110));
         y += u * 1.2;
 
-        let mut col = ButtonColumn::new(inner, u);
-        let mut exit = BattleExit::Stay;
         let idle_fx = self.fx.is_empty();
+        let mut col = ButtonColumn::grid(inner, u, if matches!(self.mode, Mode::Menu { .. }) { 2 } else { 1 });
 
-        // Buttons first (bottom-up) so the content knows how much room it has.
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         self.mode = if !idle_fx || self.b.phase != Phase::Player {
             mode
         } else {
-            match mode {
-                Mode::Idle => {
-                    let label = if self.show_danger { "Enemy Range: On" } else { "Enemy Range: Off" };
-                    if button(input, col.next(), label, ButtonStyle::Normal, u) {
-                        self.show_danger = !self.show_danger;
-                        self.danger = None;
-                    }
-                    if button(input, col.next(), "End Turn", ButtonStyle::Danger, u) {
-                        for i in self.b.living(Team::Player).collect::<Vec<_>>() {
-                            self.b.finish_action(i);
-                        }
-                        self.inspect = None;
-                    }
-                    Mode::Idle
-                }
-                Mode::Selected { unit, reach, dests, threat } => {
-                    if button(input, col.next(), "Cancel", ButtonStyle::Normal, u) {
-                        self.inspect = None;
-                        Mode::Idle
-                    } else {
-                        Mode::Selected { unit, reach, dests, threat }
-                    }
-                }
-                Mode::Menu { unit, from } => {
-                    let pos = self.b.units[unit].pos;
-                    let targets = self.b.targets_from(unit, pos);
-                    let heals = self.b.heal_targets_from(unit, pos);
-                    let mut next = None;
-                    if button(input, col.next(), "Cancel", ButtonStyle::Normal, u) {
-                        self.b.move_unit(unit, from);
-                        self.vis_pos[unit] = pv(from);
-                        next = Some(self.select(unit));
-                    }
-                    if button(input, col.next(), "Wait", ButtonStyle::Normal, u) {
-                        self.b.finish_action(unit);
-                        self.inspect = None;
-                        self.danger = None;
-                        next = Some(Mode::Idle);
-                    }
-                    if !heals.is_empty() && button(input, col.next(), "Heal", ButtonStyle::Primary, u) {
-                        next = Some(Mode::Target { unit, from, chosen: heals.first().copied(), targets: heals, heal: true });
-                    }
-                    if !targets.is_empty() && button(input, col.next(), "Attack", ButtonStyle::Primary, u) {
-                        next = Some(Mode::Target { unit, from, chosen: targets.first().copied(), targets, heal: false });
-                    }
-                    next.unwrap_or(Mode::Menu { unit, from })
-                }
-                Mode::Target { unit, from, targets, heal, chosen } => {
-                    if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
-                        Mode::Menu { unit, from }
-                    } else if let Some(t) = chosen {
-                        let label = if heal { "Heal!" } else { "Attack!" };
-                        if button(input, col.next(), label, ButtonStyle::Primary, u) {
-                            self.execute(unit, t, heal)
-                        } else {
-                            Mode::Target { unit, from, targets, heal, chosen }
-                        }
-                    } else {
-                        Mode::Target { unit, from, targets, heal, chosen }
-                    }
-                }
-                other => other,
-            }
+            self.panel_buttons(mode, &mut col, input, u)
         };
-        if let Mode::Over { .. } = self.mode {
-            // handled by over_screen
-        }
         let bottom = col.top() - u * 0.5;
 
         // Content
         match &self.mode {
-            Mode::Target { unit, chosen: Some(t), heal, .. } => {
-                if *heal {
-                    self.heal_preview(inner.x, y, inner.w, u, *unit, *t);
-                } else {
-                    let f = self.b.forecast(*unit, *t);
-                    self.forecast_box(inner.x, y, inner.w, u, *unit, *t, &f);
+            Mode::Target { unit, chosen: Some(t), kind, .. } => {
+                match kind {
+                    TargetKind::Heal => self.heal_preview(inner.x, y, inner.w, u, *unit, *t),
+                    TargetKind::Attack => {
+                        let f = self.b.forecast(*unit, *t);
+                        self.forecast_box(inner.x, y, inner.w, u, *unit, *t, &f);
+                    }
+                    TargetKind::Talk => {
+                        text_centered("Talk", inner.x + inner.w / 2.0, y, u * 0.9, ACCENT);
+                        text_centered(&self.b.units[*t].name, inner.x + inner.w / 2.0, y + u * 1.5, u * 1.1, BAD);
+                        text_centered("seems willing to listen...", inner.x + inner.w / 2.0, y + u * 2.8, u * 0.75, DIM);
+                    }
                 }
-                text("Tap the target again or press the button", inner.x, bottom, u * 0.6, DIM);
+                text("Tap the target again to confirm.", inner.x, bottom, u * 0.6, DIM);
             }
             Mode::Target { .. } => {}
-            Mode::EnemyPhase { .. } => {
-                text("The enemy is moving...", inner.x, y, u * 0.9, DIM);
+            Mode::EnemyPhase { .. } => text("The enemy is moving...", inner.x, y, u * 0.9, DIM),
+            Mode::Items { unit, .. } => {
+                let un = &self.b.units[*unit];
+                text(&format!("{}'s items", un.name), inner.x, y, u, ALLY);
+                y += u * 1.2;
+                text("Tap an item: weapons are equipped,", inner.x, y, u * 0.7, DIM);
+                y += u * 0.9;
+                text("other items are used (ends turn).", inner.x, y, u * 0.7, DIM);
             }
             _ => {
                 let unit = match &self.mode {
@@ -545,47 +595,180 @@ impl BattleScreen {
                     None => self.inspect,
                 };
                 if let Some(id) = unit {
-                    y = self.unit_info(inner.x, y, inner.w, u, id);
-                    y += u * 0.4;
+                    y = self.unit_info(inner.x, y, inner.w, u, id, bottom);
+                    y += u * 0.3;
                 }
                 if let Some(p) = tile {
                     if y < bottom {
                         self.terrain_info(inner.x, y, u, p);
                     }
-                } else if y + u * 3.0 < bottom {
-                    let hints = match self.mode {
-                        Mode::Idle => ["Tap a blue unit to move it.", "Tap an enemy to see its range.", "Grey units have already acted."],
-                        _ => ["", "", ""],
-                    };
-                    for h in hints {
+                } else if y + u * 3.0 < bottom && matches!(self.mode, Mode::Idle) && self.b.phase == Phase::Player {
+                    for h in ["Tap a blue unit to move it.", "Tap an enemy to see its range.", "Grey units have already acted."] {
                         text(h, inner.x, y, u * 0.75, DIM);
                         y += u * 1.0;
                     }
                 }
-                if let Mode::Selected { .. } = self.mode {
-                    text("Tap a blue tile to move.", inner.x, bottom, u * 0.7, DIM);
-                }
-                if let Mode::Menu { .. } = self.mode {
-                    text("Choose an action.", inner.x, bottom, u * 0.7, DIM);
-                }
             }
         }
-        if !idle_fx {
-            exit = BattleExit::Stay;
-        }
-        exit
+        BattleExit::Stay
     }
 
-    fn unit_info(&self, x: f32, mut y: f32, w: f32, u: f32, id: usize) -> f32 {
+    fn panel_buttons(&mut self, mode: Mode, col: &mut ButtonColumn, input: &mut Input, u: f32) -> Mode {
+        match mode {
+            Mode::Idle => {
+                let label = if self.show_danger { "Enemy Range: On" } else { "Enemy Range: Off" };
+                if button(input, col.next(), label, ButtonStyle::Normal, u) {
+                    self.show_danger = !self.show_danger;
+                    self.danger = None;
+                }
+                if button(input, col.next(), "End Turn", ButtonStyle::Danger, u) {
+                    for i in self.b.living(Team::Player).collect::<Vec<_>>() {
+                        self.b.finish_action(i);
+                    }
+                    self.inspect = None;
+                }
+                Mode::Idle
+            }
+            Mode::Selected { unit, reach, dests, threat } => {
+                if button(input, col.next(), "Cancel", ButtonStyle::Normal, u) {
+                    self.inspect = None;
+                    Mode::Idle
+                } else {
+                    Mode::Selected { unit, reach, dests, threat }
+                }
+            }
+            Mode::Menu { unit, from } => {
+                let pos = self.b.units[unit].pos;
+                let targets = self.b.targets_from(unit, pos);
+                let heals = self.b.heal_targets_from(unit, pos);
+                let talks = self.b.talk_targets_from(unit, pos);
+                let mut next = None;
+                // Bottom-up, two per row.
+                if button(input, col.next(), "Cancel", ButtonStyle::Normal, u) {
+                    self.b.move_unit(unit, from);
+                    self.vis_pos[unit] = pv(from);
+                    next = Some(self.select(unit));
+                }
+                if button(input, col.next(), "Wait", ButtonStyle::Normal, u) {
+                    self.b.finish_action(unit);
+                    self.inspect = None;
+                    self.danger = None;
+                    next = Some(Mode::Idle);
+                }
+                if !self.b.units[unit].items.is_empty() && button(input, col.next(), "Items", ButtonStyle::Normal, u) {
+                    next = Some(Mode::Items { unit, from });
+                }
+                if self.b.can_visit(unit) && button(input, col.next(), "Visit", ButtonStyle::Primary, u) {
+                    if let Some(r) = self.b.visit(unit) {
+                        let t = self.reward_text(r);
+                        self.fx.push_back(Fx::Say { speaker: String::new(), text: t });
+                    }
+                    self.b.finish_action(unit);
+                    next = Some(Mode::Idle);
+                }
+                if self.b.can_seize(unit) && button(input, col.next(), "Seize", ButtonStyle::Primary, u) {
+                    self.b.seize(unit);
+                    self.b.finish_action(unit);
+                    next = Some(Mode::Idle);
+                }
+                if !talks.is_empty() && button(input, col.next(), "Talk", ButtonStyle::Primary, u) {
+                    next = Some(Mode::Target { unit, from, chosen: talks.first().copied(), targets: talks, kind: TargetKind::Talk });
+                }
+                if !heals.is_empty() && button(input, col.next(), "Heal", ButtonStyle::Primary, u) {
+                    next = Some(Mode::Target { unit, from, chosen: heals.first().copied(), targets: heals, kind: TargetKind::Heal });
+                }
+                if !targets.is_empty() && button(input, col.next(), "Attack", ButtonStyle::Primary, u) {
+                    let first = targets[0];
+                    self.choose_target(unit, first, TargetKind::Attack);
+                    next = Some(Mode::Target { unit, from, chosen: Some(first), targets, kind: TargetKind::Attack });
+                }
+                next.unwrap_or(Mode::Menu { unit, from })
+            }
+            Mode::Items { unit, from } => {
+                if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
+                    return Mode::Menu { unit, from };
+                }
+                let items = self.b.units[unit].items.clone();
+                let mut next = Mode::Items { unit, from };
+                for (idx, it) in items.iter().enumerate().rev() {
+                    let usable = self.b.units[unit].can_use(it.id);
+                    let equipped = self.b.units[unit].weapon_index() == Some(idx);
+                    let label = format!("{}{}", if equipped { "* " } else { "" }, it.label());
+                    let style = if usable { ButtonStyle::Normal } else { ButtonStyle::Disabled };
+                    if button(input, col.next(), &label, style, u) {
+                        match self.b.use_item(unit, idx) {
+                            ItemUse::Equipped => {
+                                self.fx.push_back(Fx::Notice { text: format!("Equipped {}", it.id.name()), color: INK });
+                            }
+                            ItemUse::Healed { amount, hp_after } => {
+                                self.fx.push_back(Fx::Heal { target: unit, amount, hp_after });
+                                self.b.finish_action(unit);
+                                self.inspect = None;
+                                next = Mode::Idle;
+                            }
+                            ItemUse::Promoted(p) => {
+                                self.fx.push_back(Fx::Promote { unit, p });
+                                self.b.finish_action(unit);
+                                self.inspect = None;
+                                next = Mode::Idle;
+                            }
+                            ItemUse::CannotUse => {
+                                let why = match it.id.info().kind {
+                                    ItemKind::Seal => "Needs level 10 or higher.",
+                                    ItemKind::Heal(_) => "HP is already full.",
+                                    ItemKind::Weapon(_) => "Can't wield that.",
+                                };
+                                self.fx.push_back(Fx::Notice { text: why.into(), color: DIM });
+                            }
+                        }
+                    }
+                }
+                next
+            }
+            Mode::Target { unit, from, targets, kind, chosen } => {
+                if button(input, col.next(), "Back", ButtonStyle::Normal, u) {
+                    return Mode::Menu { unit, from };
+                }
+                let Some(t) = chosen else { return Mode::Target { unit, from, targets, kind, chosen } };
+                let label = match kind {
+                    TargetKind::Attack => "Attack!",
+                    TargetKind::Heal => "Heal!",
+                    TargetKind::Talk => "Talk!",
+                };
+                if button(input, col.next(), label, ButtonStyle::Primary, u) {
+                    return self.execute(unit, t, kind);
+                }
+                if kind == TargetKind::Attack {
+                    let dist = self.b.units[unit].pos.manhattan(self.b.units[t].pos);
+                    let options: Vec<usize> = self.b.units[unit].attack_weapons().into_iter().filter(|(_, w)| w.in_range(dist)).map(|(i, _)| i).collect();
+                    if options.len() > 1 {
+                        let name = self.b.units[unit].weapon().map(|w| w.name).unwrap_or("-");
+                        if button(input, col.next(), &format!("Weapon: {} >", name), ButtonStyle::Normal, u) {
+                            // Equip the next in-range weapon (inventory order rotates).
+                            let cur = self.b.units[unit].weapon_index().unwrap_or(0);
+                            let nxt = options.iter().copied().find(|&i| i > cur).unwrap_or(options[0]);
+                            self.b.units[unit].equip(nxt);
+                        }
+                    }
+                }
+                Mode::Target { unit, from, targets, kind, chosen }
+            }
+            other => other,
+        }
+    }
+
+    fn unit_info(&self, x: f32, mut y: f32, w: f32, u: f32, id: usize, bottom: f32) -> f32 {
         let un = &self.b.units[id];
         let hp = self.vis_hp[id];
-        text(&un.name, x, y, u * 1.15, team_ink(un.team));
+        text(&un.name, x, y, u * 1.15, team_ink(self.vis_team[id]));
         text_right(&format!("Lv {}", un.level), x + w, y, u, INK);
         y += u * 1.05;
         let role = if un.is_lord {
             format!("{} (Lord)", un.class.name())
         } else if un.is_boss {
             format!("{} (Boss)", un.class.name())
+        } else if un.talk {
+            format!("{} (Talk?)", un.class.name())
         } else {
             un.class.name().to_string()
         };
@@ -598,14 +781,7 @@ impl BattleScreen {
         text_right(&format!("HP {}/{}", hp, un.stats.hp), x + w, y + u * 0.55, u * 0.85, INK);
         y += u * 1.75;
         let s = un.stats;
-        let vals = [
-            (un.pow_label(), s.pow),
-            ("Skl", s.skl),
-            ("Spd", s.spd),
-            ("Lck", s.lck),
-            ("Def", s.def),
-            ("Res", s.res),
-        ];
+        let vals = [(un.pow_label(), s.pow), ("Skl", s.skl), ("Spd", s.spd), ("Lck", s.lck), ("Def", s.def), ("Res", s.res)];
         let cw = w / 3.0;
         for (i, (name, v)) in vals.iter().enumerate() {
             let cx = x + (i % 3) as f32 * cw;
@@ -614,16 +790,17 @@ impl BattleScreen {
             text_right(&v.to_string(), cx + cw - u * 0.6, cy, u * 0.85, INK);
         }
         y += u * 2.2;
-        let wpn = &un.weapon;
-        text(&format!("{} ({})", wpn.name, wpn.kind.name()), x, y, u * 0.85, ACCENT);
-        y += u * 0.95;
-        let detail = if wpn.can_attack() {
-            format!("Mt {}  Hit {}  Crt {}  Rng {}  Mov {}", wpn.might, wpn.hit, wpn.crit, wpn.range_label(), un.mov())
-        } else {
-            format!("Heals {} HP  Rng {}  Mov {}", combat::heal_amount(un), wpn.range_label(), un.mov())
-        };
-        text(&detail, x, y, u * 0.72, INK);
-        y + u * 0.6
+        let eq = un.weapon_index();
+        for (i, it) in un.items.iter().enumerate() {
+            if y > bottom - u * 1.6 {
+                break;
+            }
+            let c = if Some(i) == eq { ACCENT } else if un.can_use(it.id) { INK } else { DIM };
+            text(&format!("{}{}", if Some(i) == eq { "* " } else { "  " }, it.label()), x, y, u * 0.72, c);
+            y += u * 0.85;
+        }
+        text(&format!("Mov {}", un.mov()), x, y, u * 0.72, DIM);
+        y + u * 0.4
     }
 
     fn terrain_info(&self, x: f32, y: f32, u: f32, p: Pos) {
@@ -632,10 +809,13 @@ impl BattleScreen {
         if t.heal_percent() > 0 {
             s.push_str(&format!("  Heal {}%", t.heal_percent()));
         }
-        if t.move_cost(crate::logic::terrain::MoveType::Infantry).is_none() {
+        if t.move_cost(MoveType::Infantry).is_none() {
             s = format!("{}  (impassable)", t.name());
         }
-        text(&s, x, y + u * 0.3, u * 0.75, rgb(170, 200, 150));
+        if let Some(v) = self.b.village_at(p) {
+            s.push_str(if v.visited { "  (visited)" } else { "  Visit!" });
+        }
+        text(&s, x, y + u * 0.3, u * 0.72, rgb(170, 200, 150));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -650,14 +830,16 @@ impl BattleScreen {
         text_centered(&d.name, rx, y, u, team_ink(d.team));
         y += u * 0.8;
         let tri = |s: &SideForecast| match s.triangle {
-            1 => ("Advantage", GOOD),
-            -1 => ("Disadvantage", BAD),
+            1 => ("+", GOOD),
+            -1 => ("-", BAD),
             _ => ("", DIM),
         };
         let (ta, ca) = tri(&f.attacker);
         let (td, cd) = tri(&f.defender);
-        text_centered(&format!("{} {}", a.weapon.name, ta), lx, y, u * 0.6, ca);
-        text_centered(&format!("{} {}", d.weapon.name, td), rx, y, u * 0.6, cd);
+        let aw = a.weapon().map(|w| w.name).unwrap_or("-");
+        let dw = d.weapon().map(|w| w.name).unwrap_or("-");
+        text_centered(&format!("{} {}", aw, ta), lx, y, u * 0.65, ca);
+        text_centered(&format!("{} {}", dw, td), rx, y, u * 0.65, cd);
         y += u * 1.3;
 
         let after = |me: &SideForecast, foe: &SideForecast| (me.hp - foe.damage * foe.strikes).max(0);
@@ -682,7 +864,7 @@ impl BattleScreen {
     fn heal_preview(&self, x: f32, mut y: f32, w: f32, u: f32, healer: usize, target: usize) {
         let h = &self.b.units[healer];
         let t = &self.b.units[target];
-        let amount = combat::heal_amount(h).min(t.stats.hp - t.hp);
+        let amount = h.staff().map(|s| combat::heal_amount(h, &s)).unwrap_or(0).min(t.stats.hp - t.hp);
         text_centered("Heal", x + w / 2.0, y, u * 0.9, ACCENT);
         y += u * 1.5;
         text_centered(&t.name, x + w / 2.0, y, u * 1.1, ALLY);
@@ -725,10 +907,12 @@ impl BattleScreen {
 
     fn draw_alpha(&self, i: usize) -> f32 {
         if self.fx_started {
-            if let Some(Fx::Die { unit }) = self.fx.front() {
-                if *unit == i {
+            match self.fx.front() {
+                Some(Fx::Die { unit }) if *unit == i => {
                     return (1.0 - self.fx_t / 0.7).max(0.0) * if (self.fx_t * 20.0) as i32 % 2 == 0 { 1.0 } else { 0.5 };
                 }
+                Some(Fx::Spawn { unit }) if *unit == i => return (self.fx_t / 0.5).min(1.0),
+                _ => {}
             }
         }
         self.vis_alpha[i]
@@ -755,11 +939,12 @@ impl BattleScreen {
         let m = &self.b.map;
         for y in 0..m.height {
             for x in 0..m.width {
+                let p = Pos::new(x, y);
                 let r = lay.tile_rect(x as f32, y as f32);
-                gfx::draw_terrain(m.at(Pos::new(x, y)), r.x, r.y, r.w, x, y, self.time);
+                let visited = self.b.village_at(p).is_some_and(|v| v.visited);
+                gfx::draw_terrain(m.at(p), r.x, r.y, r.w, x, y, self.time, visited);
             }
         }
-        // Subtle grid
         let gc = Color::new(0.0, 0.0, 0.0, 0.12);
         for x in 0..=m.width {
             let px = lay.ox + x as f32 * lay.tile;
@@ -769,12 +954,15 @@ impl BattleScreen {
             let py = lay.oy + y as f32 * lay.tile;
             draw_line(lay.ox, py, lay.ox + lay.map_w, py, 1.0, gc);
         }
+        if let Objective::Seize(p) = self.b.objective {
+            let a = 0.5 + 0.5 * (self.time * 3.0).sin();
+            let r = lay.tile_rect(p.x as f32, p.y as f32);
+            draw_rectangle_lines(r.x + 2.0, r.y + 2.0, r.w - 4.0, r.h - 4.0, 3.0, Color::new(1.0, 0.85, 0.3, a));
+        }
 
-        if let Some(d) = &self.danger {
-            if self.show_danger {
-                for p in d {
-                    self.shade(lay, *p, Color::new(0.6, 0.1, 0.5, 0.28));
-                }
+        if let (Some(d), true) = (&self.danger, self.show_danger) {
+            for p in d {
+                self.shade(lay, *p, Color::new(0.6, 0.1, 0.5, 0.28));
             }
         }
         if let Some((moves, threat)) = &self.inspect_range {
@@ -788,7 +976,7 @@ impl BattleScreen {
         let pulse = (self.time * 4.0).sin() * 0.08;
         match &self.mode {
             Mode::Selected { unit, dests, threat, .. } => {
-                let heal = !self.b.units[*unit].weapon.can_attack();
+                let heal = self.b.units[*unit].attack_range().is_none();
                 let edge = if heal { Color::new(0.2, 0.9, 0.4, 0.35) } else { Color::new(1.0, 0.2, 0.2, 0.38) };
                 for p in threat.difference(dests) {
                     self.shade(lay, *p, edge);
@@ -797,8 +985,12 @@ impl BattleScreen {
                     self.shade(lay, *p, Color::new(0.25, 0.5, 1.0, 0.45 + pulse));
                 }
             }
-            Mode::Target { targets, chosen, heal, .. } => {
-                let c = if *heal { Color::new(0.2, 0.95, 0.4, 0.4 + pulse) } else { Color::new(1.0, 0.2, 0.2, 0.42 + pulse) };
+            Mode::Target { targets, chosen, kind, .. } => {
+                let c = match kind {
+                    TargetKind::Attack => Color::new(1.0, 0.2, 0.2, 0.42 + pulse),
+                    TargetKind::Heal => Color::new(0.2, 0.95, 0.4, 0.4 + pulse),
+                    TargetKind::Talk => Color::new(0.3, 0.7, 1.0, 0.42 + pulse),
+                };
                 for t in targets {
                     self.shade(lay, self.b.units[*t].pos, c);
                 }
@@ -809,8 +1001,7 @@ impl BattleScreen {
             _ => {}
         }
 
-        // Units, back to front.
-        let mut order: Vec<usize> = (0..self.b.units.len()).collect();
+        let mut order: Vec<usize> = (0..self.vis_pos.len()).collect();
         order.sort_by(|a, b| self.draw_pos(*a).y.partial_cmp(&self.draw_pos(*b).y).unwrap_or(std::cmp::Ordering::Equal));
         for i in order {
             let alpha = self.draw_alpha(i);
@@ -823,18 +1014,25 @@ impl BattleScreen {
             let moving = matches!(self.mode, Mode::Selected { unit, .. } if unit == i);
             let bob = !un.done && (((self.time * if moving { 6.0 } else { 2.0 }) + i as f32 * 0.37) as i32 % 2 == 0);
             let inset = r.w * 0.06;
-            gfx::draw_unit(look(un), r.x + inset, r.y + inset * 1.5, r.w - inset * 2.0, un.done, alpha, bob);
-            if un.is_boss || un.is_lord {
-                let c = if un.is_boss { ACCENT } else { rgb(120, 200, 255) };
+            let mut lk = UnitLook::of(un);
+            lk.team = self.vis_team[i];
+            gfx::draw_unit(lk, r.x + inset, r.y + inset * 1.5, r.w - inset * 2.0, un.done, alpha, bob);
+            if un.is_boss || un.is_lord || un.talk {
+                let c = if un.is_boss {
+                    ACCENT
+                } else if un.talk {
+                    GOOD
+                } else {
+                    rgb(120, 200, 255)
+                };
                 draw_rectangle(r.x + r.w * 0.06, r.y + r.h * 0.06, r.w * 0.12, r.w * 0.12, Color::new(c.r, c.g, c.b, alpha));
             }
             let bw = r.w * 0.8;
             hp_bar(r.x + (r.w - bw) / 2.0, r.y + r.h - r.h * 0.1, bw, (r.h * 0.09).max(3.0), self.vis_hp[i], un.stats.hp);
         }
 
-        // Cursor on the inspected / selected tile
         match &self.mode {
-            Mode::Selected { unit, .. } | Mode::Menu { unit, .. } => self.cursor(lay, self.b.units[*unit].pos, INK),
+            Mode::Selected { unit, .. } | Mode::Menu { unit, .. } | Mode::Items { unit, .. } => self.cursor(lay, self.b.units[*unit].pos, INK),
             Mode::Idle => {
                 if let Some(p) = self.inspect {
                     self.cursor(lay, p, INK);
@@ -843,13 +1041,11 @@ impl BattleScreen {
             _ => {}
         }
 
-        // Floating combat text
         for f in &self.floats {
             let r = lay.tile_rect(f.pos.x, f.pos.y - f.t * 0.6);
-            let size = lay.tile * 0.42;
             let mut c = f.color;
-            c.a = (1.0 - f.t).clamp(0.0, 1.0) * 2.0_f32.min(1.0);
-            text_centered(&f.text, r.x + r.w / 2.0, r.y + r.h * 0.2, size, c);
+            c.a = (1.0 - f.t).clamp(0.0, 1.0);
+            text_centered(&f.text, r.x + r.w / 2.0, r.y + r.h * 0.2, lay.tile * 0.42, c);
         }
     }
 
@@ -868,7 +1064,7 @@ impl BattleScreen {
                 let un = &self.b.units[id];
                 let x = r.x + u + k as f32 * (w / 2.0);
                 let bw = w / 2.0 - u * 2.0;
-                text(&un.name, x, r.y + u * 1.4, u, team_ink(un.team));
+                text(&un.name, x, r.y + u * 1.4, u, team_ink(self.vis_team[id]));
                 text_right(&format!("{}", self.vis_hp[id]), x + bw, r.y + u * 1.4, u, INK);
                 hp_bar(x, r.y + u * 2.0, bw, u * 0.6, self.vis_hp[id], un.stats.hp);
             }
@@ -885,12 +1081,23 @@ impl BattleScreen {
                 let h = u * 3.2;
                 let y = map.y + map.h / 2.0 - h / 2.0;
                 let slide = (1.0 - (k * 5.0).min(1.0)) * map.w * 0.2;
-                draw_rectangle(map.x, y, map.w, h, Color::new(0.05, 0.05, 0.1, 0.75 * a));
+                draw_rectangle(map.x, y, map.w, h, Color::new(0.05, 0.05, 0.1, 0.85 * a));
                 draw_rectangle(map.x, y, map.w, 3.0, Color::new(color.r, color.g, color.b, a));
                 draw_rectangle(map.x, y + h - 3.0, map.w, 3.0, Color::new(color.r, color.g, color.b, a));
                 let mut c = *color;
                 c.a = a;
-                text_centered(t, map.x + map.w / 2.0 + slide, y + h / 2.0 + u * 0.6, u * 1.9, c);
+                let size = (u * 1.9).min(map.w * 0.9 / (t.len() as f32 * 0.55).max(1.0));
+                text_centered(t, map.x + map.w / 2.0 + slide, y + h / 2.0 + size * 0.33, size, c);
+            }
+            Some(Fx::Notice { text: t, color }) => {
+                let a = (self.fx_t * 6.0).min(1.0).min((1.2 - self.fx_t) * 6.0).clamp(0.0, 1.0);
+                let w = (text_w(t, u) + u * 2.0).min(map.w);
+                let r = Rect::new(map.x + (map.w - w) / 2.0, map.y + map.h * 0.18, w, u * 2.0);
+                draw_rectangle(r.x, r.y, r.w, r.h, Color::new(0.08, 0.08, 0.16, 0.9 * a));
+                draw_rectangle_lines(r.x, r.y, r.w, r.h, 2.0, Color::new(color.r, color.g, color.b, a));
+                let mut c = *color;
+                c.a = a;
+                text_centered(t, r.x + w / 2.0, r.y + u * 1.35, u, c);
             }
             Some(Fx::Xp { unit, from, gained }) => {
                 let un = &self.b.units[*unit];
@@ -908,30 +1115,17 @@ impl BattleScreen {
             }
             Some(Fx::LevelUp { unit, lv }) => {
                 let un = &self.b.units[*unit];
-                let w = (map.w * 0.6).max(u * 14.0).min(map.w);
-                let h = u * 9.5;
-                let r = Rect::new(map.x + (map.w - w) / 2.0, map.y + (map.h - h) / 2.0, w, h);
-                frame(r);
-                text_centered("LEVEL UP!", r.x + w / 2.0, r.y + u * 1.6, u * 1.4, ACCENT);
-                text_centered(&format!("{}  {}  Lv {}", un.name, un.class.name(), lv.new_level), r.x + w / 2.0, r.y + u * 2.8, u * 0.9, INK);
-                let gains = lv.gains.to_array();
-                let after = lv.after.to_array();
-                let cw = (w - u * 2.0) / 2.0;
-                for i in 0..7 {
-                    let col = (i % 2) as f32;
-                    let row = (i / 2) as f32;
-                    let x = r.x + u + col * cw;
-                    let y = r.y + u * 4.4 + row * u * 1.15;
-                    let name = if i == 1 { un.pow_label() } else { STAT_NAMES[i] };
-                    text(name, x, y, u * 0.9, DIM);
-                    text_right(&after[i].to_string(), x + cw * 0.6, y, u * 0.9, INK);
-                    if gains[i] > 0 {
-                        text(&format!("+{}", gains[i]), x + cw * 0.66, y, u * 0.9, GOOD);
-                    }
-                }
-                if self.fx_t > 0.4 {
-                    text_centered("Tap to continue", r.x + w / 2.0, r.y + h - u * 0.6, u * 0.7, DIM);
-                }
+                let sub = format!("{}  {}  Lv {}", un.name, un.class.name(), lv.new_level);
+                stat_popup(map, u, "LEVEL UP!", &sub, un.pow_label(), lv.gains.to_array(), lv.after.to_array(), self.fx_t);
+            }
+            Some(Fx::Promote { unit, p }) => {
+                let un = &self.b.units[*unit];
+                let sub = format!("{}: {} > {}", un.name, p.from.name(), p.to.name());
+                stat_popup(map, u, "PROMOTION!", &sub, un.pow_label(), p.gains.to_array(), un.stats.to_array(), self.fx_t);
+            }
+            Some(Fx::Say { speaker, text: t }) => {
+                let look = self.b.units.iter().find(|u| !speaker.is_empty() && u.name == *speaker).map(UnitLook::of);
+                dialogue_box(map, u, speaker, t, look, self.fx_t);
             }
             _ => {}
         }
@@ -941,22 +1135,24 @@ impl BattleScreen {
         let u = lay.u;
         let map = Rect::new(lay.ox, lay.oy, lay.map_w, lay.map_h);
         draw_rectangle(map.x, map.y, map.w, map.h, Color::new(0.0, 0.0, 0.0, 0.45));
+        let players: Vec<usize> = (0..self.b.units.len()).filter(|&i| self.b.units[i].team == Team::Player).collect();
         let w = (map.w * 0.7).max(u * 16.0).min(screen_width() - u);
-        let h = u * 15.0;
+        let h = (u * 8.5 + players.len() as f32 * u * 1.0).min(screen_height() - u);
         let r = Rect::new(map.x + (map.w - w) / 2.0, (map.y + (map.h - h) / 2.0).max(0.0), w, h);
         frame(r);
-        let (title, c) = if victory { ("VICTORY", ACCENT) } else { ("DEFEAT", BAD) };
-        text_centered(title, r.x + w / 2.0, r.y + u * 2.2, u * 2.0, c);
+        let (title, c) = if victory { ("CHAPTER CLEAR", ACCENT) } else { ("DEFEAT", BAD) };
+        text_centered(title, r.x + w / 2.0, r.y + u * 2.0, u * 1.8, c);
         let sub = if victory {
-            format!("{} is won in {} turns.", BATTLE_NAME, self.b.turn)
+            format!("{} - {} turns", self.title, self.b.turn)
         } else {
             let lord = self.b.units.iter().find(|u| u.is_lord).map(|u| u.name.as_str()).unwrap_or("The lord");
-            format!("{} has fallen. The crossing is lost.", lord)
+            format!("{} has fallen.", lord)
         };
-        text_centered(&sub, r.x + w / 2.0, r.y + u * 3.5, u * 0.8, INK);
-        let mut y = r.y + u * 5.0;
-        for un in self.b.units.iter().filter(|u| u.team == Team::Player) {
-            text(&format!("{}  Lv {} {}", un.name, un.level, un.class.name()), r.x + u, y, u * 0.85, ALLY);
+        text_centered(&sub, r.x + w / 2.0, r.y + u * 3.3, u * 0.8, INK);
+        let mut y = r.y + u * 4.6;
+        for i in players {
+            let un = &self.b.units[i];
+            text(&format!("{}  Lv {} {}", un.name, un.level, un.class.name()), r.x + u, y, u * 0.75, ALLY);
             let (status, sc) = if un.alive {
                 (format!("HP {}/{}", un.hp, un.stats.hp), INK)
             } else if self.b.permadeath {
@@ -964,20 +1160,96 @@ impl BattleScreen {
             } else {
                 ("Retreated - will return".to_string(), DIM)
             };
-            text_right(&status, r.x + w - u, y, u * 0.85, sc);
-            y += u * 1.05;
+            text_right(&status, r.x + w - u, y, u * 0.75, sc);
+            y += u * 1.0;
         }
         let bw = (w - u * 3.0) / 2.0;
         let bh = u * 2.1;
         let by = r.y + h - bh - u * 0.8;
         let mut exit = BattleExit::Stay;
-        if button(input, Rect::new(r.x + u, by, bw, bh), "Play Again", ButtonStyle::Primary, u) {
-            exit = BattleExit::Retry;
-        }
-        if button(input, Rect::new(r.x + u * 2.0 + bw, by, bw, bh), "Title", ButtonStyle::Normal, u) {
-            exit = BattleExit::Title;
+        if victory {
+            if button(input, Rect::new(r.x + u, by, w - u * 2.0, bh), "Continue", ButtonStyle::Primary, u) {
+                exit = BattleExit::Victory;
+            }
+        } else {
+            if button(input, Rect::new(r.x + u, by, bw, bh), "Retry Chapter", ButtonStyle::Primary, u) {
+                exit = BattleExit::Retry;
+            }
+            if button(input, Rect::new(r.x + u * 2.0 + bw, by, bw, bh), "Title", ButtonStyle::Normal, u) {
+                exit = BattleExit::Title;
+            }
         }
         exit
+    }
+}
+
+/// Level-up / promotion window.
+#[allow(clippy::too_many_arguments)]
+fn stat_popup(map: Rect, u: f32, title: &str, sub: &str, pow_label: &str, gains: [i32; 7], after: [i32; 7], t: f32) {
+    let w = (map.w * 0.6).max(u * 14.0).min(map.w);
+    let h = u * 9.5;
+    let r = Rect::new(map.x + (map.w - w) / 2.0, map.y + (map.h - h) / 2.0, w, h);
+    frame(r);
+    text_centered(title, r.x + w / 2.0, r.y + u * 1.6, u * 1.4, ACCENT);
+    text_centered(sub, r.x + w / 2.0, r.y + u * 2.8, u * 0.9, INK);
+    let cw = (w - u * 2.0) / 2.0;
+    for i in 0..7 {
+        let col = (i % 2) as f32;
+        let row = (i / 2) as f32;
+        let x = r.x + u + col * cw;
+        let y = r.y + u * 4.4 + row * u * 1.15;
+        let name = if i == 1 { pow_label } else { STAT_NAMES[i] };
+        text(name, x, y, u * 0.9, DIM);
+        text_right(&after[i].to_string(), x + cw * 0.6, y, u * 0.9, INK);
+        if gains[i] > 0 {
+            text(&format!("+{}", gains[i]), x + cw * 0.66, y, u * 0.9, GOOD);
+        }
+    }
+    if t > 0.3 {
+        text_centered("Tap to continue", r.x + w / 2.0, r.y + h - u * 0.6, u * 0.7, DIM);
+    }
+}
+
+/// Dialogue box along the bottom of `area` with an optional portrait.
+pub fn dialogue_box(area: Rect, u: f32, speaker: &str, body: &str, look: Option<UnitLook>, t: f32) {
+    let h = (u * 6.5).min(area.h * 0.5);
+    let r = Rect::new(area.x + u * 0.5, area.y + area.h - h - u * 0.5, area.w - u, h);
+    frame(r);
+    let ps = h - u * 1.2;
+    let mut tx = r.x + u * 0.8;
+    if let Some(l) = look {
+        gfx::draw_portrait(l, r.x + u * 0.6, r.y + u * 0.6, ps);
+        tx += ps + u * 0.4;
+    }
+    let mut y = r.y + u * 1.5;
+    if !speaker.is_empty() {
+        let c = match look.map(|l| l.team) {
+            Some(Team::Enemy) => BAD,
+            _ => ALLY,
+        };
+        text(speaker, tx, y, u * 1.05, c);
+        y += u * 1.2;
+    }
+    let size = u * 0.85;
+    let lines = wrap(body, r.x + r.w - tx - u * 0.8, size);
+    // Typewriter reveal.
+    let total: usize = lines.iter().map(|l| l.len()).sum();
+    let mut shown = ((t * 90.0) as usize).min(total);
+    for line in lines {
+        if shown == 0 {
+            break;
+        }
+        let n = line.len().min(shown);
+        let part: String = line.chars().take(n).collect();
+        text(&part, tx, y, size, INK);
+        shown -= n;
+        y += size * 1.25;
+    }
+    if t > 0.3 {
+        let blink = ((t * 3.0) as i32 % 2) == 0;
+        if blink {
+            text_right("v", r.x + r.w - u * 0.6, r.y + r.h - u * 0.5, u * 0.8, ACCENT);
+        }
     }
 }
 

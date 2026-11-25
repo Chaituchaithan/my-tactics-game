@@ -5,7 +5,7 @@
 use super::battle::Battle;
 use super::combat::Forecast;
 use super::pathfinding::distance_field;
-use super::unit::Team;
+use super::unit::{AiMode, Team};
 use super::Pos;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub fn decide(b: &Battle, id: usize) -> AiAction {
     let mut best: Option<(f32, Pos, usize)> = None;
     for &dest in &reach.stoppable {
         for target in b.targets_from(id, dest) {
-            let f = b.forecast_from(id, dest, target);
+            let f = b.forecast_best(id, dest, target);
             if f.attacker.damage == 0 {
                 continue;
             }
@@ -54,11 +54,12 @@ pub fn decide(b: &Battle, id: usize) -> AiAction {
     if let Some((_, dest, target)) = best {
         return AiAction::Attack { dest, target };
     }
-    if u.mov() == 0 {
+    if u.mov() == 0 || u.ai != AiMode::Aggressive {
         return AiAction::Wait;
     }
 
-    let foes: Vec<Pos> = b.living(Team::Player).map(|i| b.units[i].pos).collect();
+    let foe_team = if u.team == Team::Player { Team::Enemy } else { Team::Player };
+    let foes: Vec<Pos> = b.living(foe_team).map(|i| b.units[i].pos).collect();
     if foes.is_empty() {
         return AiAction::Wait;
     }
@@ -80,17 +81,18 @@ mod tests {
     use super::*;
     use crate::logic::map::Map;
     use crate::logic::terrain::Terrain;
-    use crate::logic::unit::{weapons, Class, Stats, Unit, Weapon};
+    use crate::logic::items::ItemId;
+    use crate::logic::unit::{Class, Stats, Unit};
 
-    fn u(team: Team, class: Class, pos: Pos, hp: i32, w: Weapon) -> Unit {
-        Unit::new("U", class, team, 1, Stats::new(hp, 6, 5, 5, 0, 2, 0), Stats::default(), w, pos)
+    fn u(team: Team, class: Class, pos: Pos, hp: i32, w: ItemId) -> Unit {
+        Unit::new("U", class, team, 1, Stats::new(hp, 6, 5, 5, 0, 2, 0), Stats::default(), &[w], pos)
     }
 
     #[test]
     fn attacks_target_in_reach() {
         let units = vec![
-            u(Team::Player, Class::Lancer, Pos::new(0, 0), 20, weapons::iron_lance()),
-            u(Team::Enemy, Class::Brigand, Pos::new(4, 0), 20, weapons::iron_axe()),
+            u(Team::Player, Class::Lancer, Pos::new(0, 0), 20, ItemId::IronLance),
+            u(Team::Enemy, Class::Brigand, Pos::new(4, 0), 20, ItemId::IronAxe),
         ];
         let b = Battle::new(Map::filled(10, 10, Terrain::Plains), units, 1, true);
         match decide(&b, 1) {
@@ -105,9 +107,9 @@ mod tests {
     #[test]
     fn prefers_kill_and_weak_target() {
         let units = vec![
-            u(Team::Player, Class::Lancer, Pos::new(0, 0), 30, weapons::iron_lance()),
-            u(Team::Player, Class::Cleric, Pos::new(0, 4), 5, weapons::mend()),
-            u(Team::Enemy, Class::Brigand, Pos::new(3, 2), 20, weapons::iron_axe()),
+            u(Team::Player, Class::Lancer, Pos::new(0, 0), 30, ItemId::IronLance),
+            u(Team::Player, Class::Cleric, Pos::new(0, 4), 5, ItemId::Mend),
+            u(Team::Enemy, Class::Brigand, Pos::new(3, 2), 20, ItemId::IronAxe),
         ];
         let b = Battle::new(Map::filled(10, 10, Terrain::Plains), units, 1, true);
         assert!(matches!(decide(&b, 2), AiAction::Attack { target: 1, .. }));
@@ -116,12 +118,12 @@ mod tests {
     #[test]
     fn advances_when_nothing_in_reach() {
         let units = vec![
-            u(Team::Player, Class::Lord, Pos::new(0, 0), 20, weapons::iron_sword()),
-            u(Team::Enemy, Class::Soldier, Pos::new(14, 0), 20, weapons::iron_lance()),
+            u(Team::Player, Class::Lord, Pos::new(0, 0), 20, ItemId::IronSword),
+            u(Team::Enemy, Class::Soldier, Pos::new(14, 0), 20, ItemId::IronLance),
         ];
         let b = Battle::new(Map::filled(16, 3, Terrain::Plains), units, 1, true);
         match decide(&b, 1) {
-            AiAction::Move { dest } => assert_eq!(dest, Pos::new(10, 0)),
+            AiAction::Move { dest } => assert_eq!(dest, Pos::new(9, 0)),
             other => panic!("expected move, got {other:?}"),
         }
     }
@@ -134,8 +136,8 @@ mod tests {
             ".....=......",
         ]);
         let units = vec![
-            u(Team::Player, Class::Lord, Pos::new(0, 0), 20, weapons::iron_sword()),
-            u(Team::Enemy, Class::Mercenary, Pos::new(9, 0), 20, weapons::iron_sword()),
+            u(Team::Player, Class::Lord, Pos::new(0, 0), 20, ItemId::IronSword),
+            u(Team::Enemy, Class::Mercenary, Pos::new(9, 0), 20, ItemId::IronSword),
         ];
         let b = Battle::new(map.clone(), units, 1, true);
         let AiAction::Move { dest } = decide(&b, 1) else { panic!("should move") };
@@ -145,10 +147,22 @@ mod tests {
     }
 
     #[test]
+    fn guards_hold_position() {
+        let units = vec![
+            u(Team::Player, Class::Lord, Pos::new(0, 0), 20, ItemId::IronSword),
+            u(Team::Enemy, Class::Mercenary, Pos::new(9, 0), 20, ItemId::IronSword).with_ai(AiMode::Guard),
+        ];
+        let mut b = Battle::new(Map::filled(12, 3, Terrain::Plains), units, 1, true);
+        assert_eq!(decide(&b, 1), AiAction::Wait);
+        b.units[0].pos = Pos::new(5, 0);
+        assert!(matches!(decide(&b, 1), AiAction::Attack { target: 0, .. }));
+    }
+
+    #[test]
     fn stationary_boss_waits_unless_target_in_range() {
-        let mut boss = u(Team::Enemy, Class::Warlord, Pos::new(5, 5), 30, weapons::cleaver()).boss();
+        let mut boss = u(Team::Enemy, Class::Warlord, Pos::new(5, 5), 30, ItemId::Cleaver).boss();
         boss.stats.pow = 10;
-        let units = vec![u(Team::Player, Class::Lord, Pos::new(0, 0), 20, weapons::iron_sword()), boss];
+        let units = vec![u(Team::Player, Class::Lord, Pos::new(0, 0), 20, ItemId::IronSword), boss];
         let mut b = Battle::new(Map::filled(10, 10, Terrain::Plains), units, 1, true);
         assert_eq!(decide(&b, 1), AiAction::Wait);
         b.units[0].pos = Pos::new(5, 6);
