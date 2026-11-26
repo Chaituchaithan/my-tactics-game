@@ -105,6 +105,14 @@ cargo test            # 98 tests: combat, pathfinding, AI, items, maps, supports
 cargo test --release -- --ignored --nocapture   # auto-battle all 16 chapters
 ```
 
+## Playing in a browser
+
+```sh
+./scripts/serve-web.sh      # builds the WebAssembly version, serves http://127.0.0.1:8080
+```
+
+Saves don't persist in the browser build. Use the desktop or Android build for a real campaign.
+
 ## Building the APK
 
 Macroquad apps need **cargo-quad-apk**, the miniquad fork of cargo-apk. Plain `cargo apk` targets the
@@ -115,8 +123,9 @@ official Docker image `notfl3/cargo-apk`, which bundles all of it.
 ### Option A: locally with Docker
 
 ```sh
-# one-time, if you don't have Docker Desktop:
-brew install colima docker && colima start --arch x86_64 --memory 6
+# one-time, if you don't have Docker Desktop (Apple Silicon):
+brew install colima docker
+colima start --vm-type vz --vz-rosetta --mount "$PWD:w" --mount "$HOME:w"
 
 ./scripts/build-apk.sh            # → dist/emberfall.apk
 ./scripts/build-apk.sh --install  # build and install over USB (adb)
